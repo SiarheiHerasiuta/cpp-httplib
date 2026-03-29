@@ -274,7 +274,7 @@ TEST(SocketStream, wait_writable_INET) {
   sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
-  addr.sin_port = htons(PORT + 1);
+  addr.sin_port = htons(static_cast<uint16_t>(PORT + 1));
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
   int disconnected_svr_sock = -1;
@@ -315,6 +315,19 @@ TEST(SocketStream, wait_writable_INET) {
   ASSERT_EQ(0, close(disconnected_svr_sock));
 }
 #endif // #ifndef _WIN32
+
+TEST(SetSocketOptTest, TcpNoDelay) {
+  auto sock = ::socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_NE(sock, INVALID_SOCKET);
+  EXPECT_TRUE(set_socket_opt(sock, IPPROTO_TCP, TCP_NODELAY, 1));
+
+  int val = 0;
+  socklen_t len = sizeof(val);
+  ASSERT_EQ(0, ::getsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+                            reinterpret_cast<char *>(&val), &len));
+  EXPECT_NE(val, 0);
+  detail::close_socket(sock);
+}
 
 TEST(ClientTest, MoveConstructible) {
   EXPECT_FALSE(std::is_copy_constructible<Client>::value);
@@ -1449,13 +1462,8 @@ TEST_F(ChunkedEncodingTest, WithResponseHandlerAndContentReceiver) {
 }
 
 TEST(RangeTest, FromHTTPBin_Online) {
-#ifdef CPPHTTPLIB_DEFAULT_HTTPBIN
-  auto host = "httpcan.org";
+  auto host = "httpbingo.org";
   auto path = std::string{"/range/32"};
-#else
-  auto host = "nghttp2.org";
-  auto path = std::string{"/httpbin/range/32"};
-#endif
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
   auto port = 443;
@@ -1489,12 +1497,16 @@ TEST(RangeTest, FromHTTPBin_Online) {
     EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   }
 
+  // go-httpbin (httpbingo.org) returns 206 even when the range covers the
+  // entire resource, while the original httpbin returned 200. Both are
+  // acceptable per RFC 9110 §15.3.7, so we accept either status code.
   {
     Headers headers = {make_range_header({{0, 31}})};
     auto res = cli.Get(path, headers);
     ASSERT_TRUE(res);
     EXPECT_EQ("abcdefghijklmnopqrstuvwxyzabcdef", res->body);
-    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_TRUE(res->status == StatusCode::OK_200 ||
+                res->status == StatusCode::PartialContent_206);
   }
 
   {
@@ -1502,14 +1514,17 @@ TEST(RangeTest, FromHTTPBin_Online) {
     auto res = cli.Get(path, headers);
     ASSERT_TRUE(res);
     EXPECT_EQ("abcdefghijklmnopqrstuvwxyzabcdef", res->body);
-    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_TRUE(res->status == StatusCode::OK_200 ||
+                res->status == StatusCode::PartialContent_206);
   }
 
+  // go-httpbin returns 206 with clamped range for over-range requests,
+  // while the original httpbin returned 416. Both behaviors are observed
+  // in real servers, so we only verify the request succeeds.
   {
     Headers headers = {make_range_header({{0, 32}})};
     auto res = cli.Get(path, headers);
     ASSERT_TRUE(res);
-    EXPECT_EQ(StatusCode::RangeNotSatisfiable_416, res->status);
   }
 }
 
@@ -1623,13 +1638,8 @@ TEST(ConnectionErrorTest, Timeout_Online) {
 }
 
 TEST(CancelTest, NoCancel_Online) {
-#ifdef CPPHTTPLIB_DEFAULT_HTTPBIN
-  auto host = "httpcan.org";
+  auto host = "httpbingo.org";
   auto path = std::string{"/range/32"};
-#else
-  auto host = "nghttp2.org";
-  auto path = std::string{"/httpbin/range/32"};
-#endif
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
   auto port = 443;
@@ -1647,13 +1657,11 @@ TEST(CancelTest, NoCancel_Online) {
 }
 
 TEST(CancelTest, WithCancelSmallPayload_Online) {
-#ifdef CPPHTTPLIB_DEFAULT_HTTPBIN
-  auto host = "httpcan.org";
-  auto path = std::string{"/range/32"};
-#else
-  auto host = "nghttp2.org";
-  auto path = std::string{"/httpbin/range/32"};
-#endif
+  // Use /bytes with a large payload so that the DownloadProgress callback
+  // (which only fires for Content-Length responses) is invoked before the
+  // entire body is received, giving cancellation a chance to fire.
+  auto host = "httpbingo.org";
+  auto path = std::string{"/bytes/524288"};
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
   auto port = 443;
@@ -1670,13 +1678,8 @@ TEST(CancelTest, WithCancelSmallPayload_Online) {
 }
 
 TEST(CancelTest, WithCancelLargePayload_Online) {
-#ifdef CPPHTTPLIB_DEFAULT_HTTPBIN
-  auto host = "httpcan.org";
-  auto path = std::string{"/range/65536"};
-#else
-  auto host = "nghttp2.org";
-  auto path = std::string{"/httpbin/range/65536"};
-#endif
+  auto host = "httpbingo.org";
+  auto path = std::string{"/bytes/524288"};
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
   auto port = 443;
@@ -2027,13 +2030,8 @@ static std::string remove_whitespace(const std::string &input) {
 }
 
 TEST(BaseAuthTest, FromHTTPWatch_Online) {
-#ifdef CPPHTTPLIB_DEFAULT_HTTPBIN
-  auto host = "httpcan.org";
+  auto host = "httpbingo.org";
   auto path = std::string{"/basic-auth/hello/world"};
-#else
-  auto host = "nghttp2.org";
-  auto path = std::string{"/httpbin/basic-auth/hello/world"};
-#endif
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
   auto port = 443;
@@ -2053,8 +2051,9 @@ TEST(BaseAuthTest, FromHTTPWatch_Online) {
     auto res =
         cli.Get(path, {make_basic_authentication_header("hello", "world")});
     ASSERT_TRUE(res);
-    EXPECT_EQ("{\"authenticated\":true,\"user\":\"hello\"}",
-              remove_whitespace(res->body));
+    auto body = remove_whitespace(res->body);
+    EXPECT_TRUE(body.find("\"authenticated\":true") != std::string::npos);
+    EXPECT_TRUE(body.find("\"user\":\"hello\"") != std::string::npos);
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
 
@@ -2062,8 +2061,9 @@ TEST(BaseAuthTest, FromHTTPWatch_Online) {
     cli.set_basic_auth("hello", "world");
     auto res = cli.Get(path);
     ASSERT_TRUE(res);
-    EXPECT_EQ("{\"authenticated\":true,\"user\":\"hello\"}",
-              remove_whitespace(res->body));
+    auto body = remove_whitespace(res->body);
+    EXPECT_TRUE(body.find("\"authenticated\":true") != std::string::npos);
+    EXPECT_TRUE(body.find("\"user\":\"hello\"") != std::string::npos);
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
 
@@ -2084,24 +2084,12 @@ TEST(BaseAuthTest, FromHTTPWatch_Online) {
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
 TEST(DigestAuthTest, FromHTTPWatch_Online) {
-#ifdef CPPHTTPLIB_DEFAULT_HTTPBIN
-  auto host = "httpcan.org";
+  auto host = "httpbingo.org";
   auto unauth_path = std::string{"/digest-auth/auth/hello/world"};
   auto paths = std::vector<std::string>{
       "/digest-auth/auth/hello/world/MD5",
       "/digest-auth/auth/hello/world/SHA-256",
-      "/digest-auth/auth/hello/world/SHA-512",
   };
-#else
-  auto host = "nghttp2.org";
-  auto unauth_path = std::string{"/httpbin/digest-auth/auth/hello/world"};
-  auto paths = std::vector<std::string>{
-      "/httpbin/digest-auth/auth/hello/world/MD5",
-      "/httpbin/digest-auth/auth/hello/world/SHA-256",
-      "/httpbin/digest-auth/auth/hello/world/SHA-512",
-      "/httpbin/digest-auth/auth-int/hello/world/MD5",
-  };
-#endif
 
   auto port = 443;
   SSLClient cli(host, port);
@@ -2118,27 +2106,18 @@ TEST(DigestAuthTest, FromHTTPWatch_Online) {
     for (const auto &path : paths) {
       auto res = cli.Get(path.c_str());
       ASSERT_TRUE(res);
-#ifdef CPPHTTPLIB_DEFAULT_HTTPBIN
-      std::string algo(path.substr(path.rfind('/') + 1));
-      EXPECT_EQ(
-          remove_whitespace("{\"algorithm\":\"" + algo +
-                            "\",\"authenticated\":true,\"user\":\"hello\"}\n"),
-          remove_whitespace(res->body));
-#else
-      EXPECT_EQ("{\"authenticated\":true,\"user\":\"hello\"}",
-                remove_whitespace(res->body));
-#endif
+      auto body = remove_whitespace(res->body);
+      EXPECT_TRUE(body.find("\"authenticated\":true") != std::string::npos);
+      EXPECT_TRUE(body.find("\"user\":\"hello\"") != std::string::npos);
       EXPECT_EQ(StatusCode::OK_200, res->status);
     }
 
-#ifdef CPPHTTPLIB_DEFAULT_HTTPBIN
     cli.set_digest_auth("hello", "bad");
     for (const auto &path : paths) {
       auto res = cli.Get(path.c_str());
       ASSERT_TRUE(res);
       EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
     }
-#endif
   }
 }
 
@@ -2178,7 +2157,8 @@ TEST(SpecifyServerIPAddressTest, RealHostname_Online) {
 }
 
 TEST(AbsoluteRedirectTest, Redirect_Online) {
-  auto host = "nghttp2.org";
+  auto host = "httpbingo.org";
+  auto path = std::string{"/absolute-redirect/3"};
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
   SSLClient cli(host);
@@ -2187,13 +2167,14 @@ TEST(AbsoluteRedirectTest, Redirect_Online) {
 #endif
 
   cli.set_follow_location(true);
-  auto res = cli.Get("/httpbin/absolute-redirect/3");
+  auto res = cli.Get(path);
   ASSERT_TRUE(res);
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
 TEST(RedirectTest, Redirect_Online) {
-  auto host = "nghttp2.org";
+  auto host = "httpbingo.org";
+  auto path = std::string{"/redirect/3"};
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
   SSLClient cli(host);
@@ -2202,13 +2183,14 @@ TEST(RedirectTest, Redirect_Online) {
 #endif
 
   cli.set_follow_location(true);
-  auto res = cli.Get("/httpbin/redirect/3");
+  auto res = cli.Get(path);
   ASSERT_TRUE(res);
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
 TEST(RelativeRedirectTest, Redirect_Online) {
-  auto host = "nghttp2.org";
+  auto host = "httpbingo.org";
+  auto path = std::string{"/relative-redirect/3"};
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
   SSLClient cli(host);
@@ -2217,13 +2199,14 @@ TEST(RelativeRedirectTest, Redirect_Online) {
 #endif
 
   cli.set_follow_location(true);
-  auto res = cli.Get("/httpbin/relative-redirect/3");
+  auto res = cli.Get(path);
   ASSERT_TRUE(res);
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
 TEST(TooManyRedirectTest, Redirect_Online) {
-  auto host = "nghttp2.org";
+  auto host = "httpbingo.org";
+  auto path = std::string{"/redirect/21"};
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
   SSLClient cli(host);
@@ -2232,7 +2215,7 @@ TEST(TooManyRedirectTest, Redirect_Online) {
 #endif
 
   cli.set_follow_location(true);
-  auto res = cli.Get("/httpbin/redirect/21");
+  auto res = cli.Get(path);
   ASSERT_TRUE(!res);
   EXPECT_EQ(Error::ExceedRedirectCount, res.error());
 }
@@ -8372,13 +8355,8 @@ TEST(GetWithParametersTest, GetWithParameters2) {
 }
 
 TEST(ClientDefaultHeadersTest, DefaultHeaders_Online) {
-#ifdef CPPHTTPLIB_DEFAULT_HTTPBIN
-  auto host = "httpcan.org";
+  auto host = "httpbingo.org";
   auto path = std::string{"/range/32"};
-#else
-  auto host = "nghttp2.org";
-  auto path = std::string{"/httpbin/range/32"};
-#endif
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
   SSLClient cli(host);
@@ -8939,7 +8917,7 @@ TEST(ClientVulnerabilityTest, UnboundedReadWithoutContentLength) {
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT + 2);
+    addr.sin_port = htons(static_cast<uint16_t>(PORT + 2));
     ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
     int opt = 1;
@@ -9045,7 +9023,7 @@ TEST(ClientVulnerabilityTest, PayloadMaxLengthZeroMeansNoLimit) {
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT + 2);
+    addr.sin_port = htons(static_cast<uint16_t>(PORT + 2));
     ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
     int opt = 1;
@@ -9156,7 +9134,7 @@ TEST(ClientVulnerabilityTest, ContentReceiverBypassesDefaultPayloadMaxLength) {
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT + 2);
+    addr.sin_port = htons(static_cast<uint16_t>(PORT + 2));
     ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
     int opt = 1;
@@ -9265,7 +9243,7 @@ TEST(ClientVulnerabilityTest,
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT + 2);
+    addr.sin_port = htons(static_cast<uint16_t>(PORT + 2));
     ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
     int opt = 1;
@@ -9373,7 +9351,7 @@ TEST(ClientVulnerabilityTest,
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT + 2);
+    addr.sin_port = htons(static_cast<uint16_t>(PORT + 2));
     ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
     int opt = 1;
@@ -9509,7 +9487,7 @@ TEST(ClientVulnerabilityTest, ZipBombWithoutContentLength) {
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
-  addr.sin_port = htons(PORT + 3);
+  addr.sin_port = htons(static_cast<uint16_t>(PORT + 3));
   ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
   int opt = 1;
@@ -9669,13 +9647,8 @@ TEST(SSLClientTest, UpdateCAStoreWithPem_Online) {
 }
 
 TEST(SSLClientTest, ServerNameIndication_Online) {
-#ifdef CPPHTTPLIB_DEFAULT_HTTPBIN
-  auto host = "httpcan.org";
+  auto host = "httpbingo.org";
   auto path = std::string{"/get"};
-#else
-  auto host = "nghttp2.org";
-  auto path = std::string{"/httpbin/get"};
-#endif
 
   SSLClient cli(host, 443);
   auto res = cli.Get(path);
@@ -12062,6 +12035,97 @@ TEST(MultipartFormDataTest, UploadItemsHasContentLength) {
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
+TEST(MultipartFormDataTest, ContentProviderCoalescesWrites) {
+  // Verify that make_multipart_content_provider coalesces many small segments
+  // into fewer sink.write() calls to avoid TCP packet fragmentation (#2410).
+  constexpr size_t kItemCount = 1000;
+
+  UploadFormDataItems items;
+  items.reserve(kItemCount);
+  for (size_t i = 0; i < kItemCount; i++) {
+    items.push_back(
+        {"field" + std::to_string(i), "value" + std::to_string(i), "", ""});
+  }
+
+  const std::string boundary = "----test-boundary";
+  auto content_length = detail::get_multipart_content_length(items, boundary);
+  auto provider = detail::make_multipart_content_provider(items, boundary);
+
+  // Drive the provider the same way write_content_with_progress does
+  size_t write_count = 0;
+  size_t total_bytes = 0;
+
+  DataSink sink;
+  size_t offset = 0;
+  sink.write = [&](const char *d, size_t l) -> bool {
+    (void)d;
+    write_count++;
+    total_bytes += l;
+    offset += l;
+    return true;
+  };
+  sink.is_writable = []() -> bool { return true; };
+
+  while (offset < content_length) {
+    ASSERT_TRUE(provider(offset, content_length - offset, sink));
+  }
+
+  EXPECT_EQ(content_length, total_bytes);
+
+  // The total number of segments is 3 * kItemCount + 1 = 3001.
+  // With buffering into 64KB blocks, write_count should be much smaller.
+  auto segment_count = 3 * kItemCount + 1;
+  EXPECT_LT(write_count, segment_count / 10);
+}
+
+TEST(MultipartFormDataTest, ManyItemsEndToEnd) {
+  // Integration test: send many UploadFormDataItems and verify the server
+  // receives all of them correctly (#2410).
+  constexpr size_t kItemCount = 500;
+
+  auto handled = false;
+
+  Server svr;
+  svr.Post("/upload", [&](const Request &req, Response &res) {
+    EXPECT_EQ(kItemCount, req.form.fields.size());
+    for (size_t i = 0; i < kItemCount; i++) {
+      auto key = "field" + std::to_string(i);
+      auto val = "value" + std::to_string(i);
+      auto it = req.form.fields.find(key);
+      if (it != req.form.fields.end()) {
+        EXPECT_EQ(val, it->second.content);
+      } else {
+        ADD_FAILURE() << "Missing field: " << key;
+      }
+    }
+    res.set_content("ok", "text/plain");
+    handled = true;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+    ASSERT_TRUE(handled);
+  });
+
+  svr.wait_until_ready();
+
+  UploadFormDataItems items;
+  items.reserve(kItemCount);
+  for (size_t i = 0; i < kItemCount; i++) {
+    items.push_back(
+        {"field" + std::to_string(i), "value" + std::to_string(i), "", ""});
+  }
+
+  Client cli(HOST, port);
+  auto res = cli.Post("/upload", items);
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+
 TEST(MultipartFormDataTest, MakeFileProvider) {
   // Verify make_file_provider sends a file's contents correctly.
   const std::string file_content(4096, 'Z');
@@ -12400,7 +12464,7 @@ TEST(VulnerabilityTest, CRLFInjectionInHeaders) {
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT + 1);
+    addr.sin_port = htons(static_cast<uint16_t>(PORT + 1));
     ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
     ::bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
     ::listen(srv, 1);
@@ -17306,3 +17370,145 @@ TEST(SymlinkTest, SymlinkEscapeFromBaseDirectory) {
   EXPECT_EQ(StatusCode::Forbidden_403, res->status);
 }
 #endif
+
+TEST(RequestSmugglingTest, UnconsumedGETBodyOnFileHandler) {
+  // A GET request with Content-Length to a static file handler must have its
+  // body drained before the keep-alive connection is reused. Otherwise the
+  // unread body bytes are interpreted as the next HTTP request.
+  //
+  // The body is sent AFTER receiving the first response (as in the original
+  // PoC) so that the stream_line_reader cannot buffer it together with the
+  // headers of the first request.
+  Server svr;
+  svr.set_mount_point("/", "./www");
+
+  std::atomic<int> smuggled_count(0);
+  svr.Get("/smuggled", [&](const Request &, Response &res) {
+    smuggled_count++;
+    res.set_content("oops", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port("localhost");
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  auto error = Error::Success;
+  auto sock = detail::create_client_socket(
+      "localhost", "", port, AF_UNSPEC, false, false, nullptr,
+      /*connection_timeout_sec=*/2, 0,
+      /*read_timeout_sec=*/2, 0,
+      /*write_timeout_sec=*/2, 0, std::string(), error);
+  ASSERT_NE(INVALID_SOCKET, sock);
+  auto sock_se = detail::scope_exit([&] { detail::close_socket(sock); });
+
+  // The "smuggled" request will be sent as the body of the outer GET
+  std::string smuggled = "GET /smuggled HTTP/1.1\r\n"
+                         "Host: localhost\r\n"
+                         "Connection: close\r\n"
+                         "\r\n";
+
+  // Step 1: Send only the outer request headers (no body yet)
+  std::string outer_headers = "GET /file HTTP/1.1\r\n"
+                              "Host: localhost\r\n"
+                              "Content-Length: " +
+                              std::to_string(smuggled.size()) +
+                              "\r\n"
+                              "\r\n";
+
+  auto sent = send(sock, outer_headers.data(), outer_headers.size(), 0);
+  ASSERT_EQ(static_cast<ssize_t>(outer_headers.size()), sent);
+
+  // Step 2: Read the first response (server serves file without reading body)
+  std::string first_response;
+  char buf[4096];
+  for (;;) {
+    auto n = recv(sock, buf, sizeof(buf), 0);
+    if (n <= 0) break;
+    first_response.append(buf, static_cast<size_t>(n));
+    // Stop once we have a complete response (headers + body)
+    auto hdr_end = first_response.find("\r\n\r\n");
+    if (hdr_end != std::string::npos) {
+      // Check for Content-Length to know when the body is complete
+      auto cl_pos = first_response.find("Content-Length:");
+      if (cl_pos != std::string::npos) {
+        auto cl_val_start = cl_pos + 15; // length of "Content-Length:"
+        auto cl_val_end = first_response.find("\r\n", cl_val_start);
+        auto cl = std::stoul(
+            first_response.substr(cl_val_start, cl_val_end - cl_val_start));
+        if (first_response.size() >= hdr_end + 4 + cl) { break; }
+      } else {
+        break; // No Content-Length, assume headers-only response
+      }
+    }
+  }
+  ASSERT_TRUE(first_response.find("HTTP/1.1 200") != std::string::npos);
+
+  // Step 3: Now send the body, which looks like a new HTTP request.
+  // On a vulnerable server the keep-alive loop reads this as a second request.
+  sent = send(sock, smuggled.data(), smuggled.size(), 0);
+  ASSERT_EQ(static_cast<ssize_t>(smuggled.size()), sent);
+
+  // Step 4: Try to read a second response (should NOT exist after fix)
+  std::string second_response;
+  for (;;) {
+    auto n = recv(sock, buf, sizeof(buf), 0);
+    if (n <= 0) break;
+    second_response.append(buf, static_cast<size_t>(n));
+  }
+
+  // The smuggled request must NOT have been processed
+  EXPECT_EQ(0, smuggled_count.load());
+}
+
+TEST(RequestSmugglingTest, ContentLengthAndTransferEncodingRejected) {
+  // RFC 9112 §6.3: A request with both Content-Length and Transfer-Encoding
+  // must be rejected with 400 Bad Request.
+  Server svr;
+  svr.Post("/test", [&](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  thread t = thread([&] { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  // Exact "chunked"
+  {
+    auto req = "POST /test HTTP/1.1\r\n"
+               "Host: localhost\r\n"
+               "Content-Length: 5\r\n"
+               "Transfer-Encoding: chunked\r\n"
+               "Connection: close\r\n"
+               "\r\n"
+               "hello";
+
+    std::string response;
+    ASSERT_TRUE(send_request(1, req, &response));
+    EXPECT_EQ("HTTP/1.1 400 Bad Request",
+              response.substr(0, response.find("\r\n")));
+  }
+
+  // Multi-valued Transfer-Encoding (e.g., "gzip, chunked")
+  {
+    auto req = "POST /test HTTP/1.1\r\n"
+               "Host: localhost\r\n"
+               "Content-Length: 5\r\n"
+               "Transfer-Encoding: gzip, chunked\r\n"
+               "Connection: close\r\n"
+               "\r\n"
+               "hello";
+
+    std::string response;
+    ASSERT_TRUE(send_request(1, req, &response));
+    EXPECT_EQ("HTTP/1.1 400 Bad Request",
+              response.substr(0, response.find("\r\n")));
+  }
+}
