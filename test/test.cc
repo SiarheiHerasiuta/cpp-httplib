@@ -3120,45 +3120,40 @@ TEST(RequestHandlerTest, PreRequestHandler) {
   }
 }
 
-TEST(AnyTest, BasicOperations) {
-  // Default construction
-  httplib::any a;
-  EXPECT_FALSE(a.has_value());
+TEST(UserDataTest, BasicOperations) {
+  httplib::UserData ud;
 
-  // Value construction and any_cast (pointer form, noexcept)
-  httplib::any b(42);
-  EXPECT_TRUE(b.has_value());
-  auto *p = httplib::any_cast<int>(&b);
+  // Initially empty
+  EXPECT_FALSE(ud.has("key"));
+  EXPECT_EQ(nullptr, ud.get<int>("key"));
+
+  // set and get
+  ud.set("key", 42);
+  EXPECT_TRUE(ud.has("key"));
+  auto *p = ud.get<int>("key");
   ASSERT_NE(nullptr, p);
   EXPECT_EQ(42, *p);
 
   // Type mismatch → nullptr
-  auto *q = httplib::any_cast<std::string>(&b);
-  EXPECT_EQ(nullptr, q);
+  EXPECT_EQ(nullptr, ud.get<std::string>("key"));
 
-  // any_cast (value form) succeeds
-  EXPECT_EQ(42, httplib::any_cast<int>(b));
+  // Overwrite with different type
+  ud.set("key", std::string("hello"));
+  EXPECT_EQ(nullptr, ud.get<int>("key"));
+  auto *s = ud.get<std::string>("key");
+  ASSERT_NE(nullptr, s);
+  EXPECT_EQ("hello", *s);
 
-  // any_cast (value form) throws on type mismatch
-#ifndef CPPHTTPLIB_NO_EXCEPTIONS
-  EXPECT_THROW(httplib::any_cast<std::string>(b), httplib::bad_any_cast);
-#endif
+  // erase
+  ud.erase("key");
+  EXPECT_FALSE(ud.has("key"));
 
-  // Copy
-  httplib::any c = b;
-  EXPECT_EQ(42, httplib::any_cast<int>(c));
-
-  // Move
-  httplib::any d = std::move(c);
-  EXPECT_EQ(42, httplib::any_cast<int>(d));
-
-  // Assignment with different type
-  b = std::string("hello");
-  EXPECT_EQ("hello", httplib::any_cast<std::string>(b));
-
-  // Reset
-  b.reset();
-  EXPECT_FALSE(b.has_value());
+  // clear
+  ud.set("a", 1);
+  ud.set("b", 2);
+  ud.clear();
+  EXPECT_FALSE(ud.has("a"));
+  EXPECT_FALSE(ud.has("b"));
 }
 
 TEST(RequestHandlerTest, ResponseUserDataInPreRouting) {
@@ -3169,12 +3164,12 @@ TEST(RequestHandlerTest, ResponseUserDataInPreRouting) {
   Server svr;
 
   svr.set_pre_routing_handler([](const Request & /*req*/, Response &res) {
-    res.user_data["auth"] = AuthCtx{"alice"};
+    res.user_data.set("auth", AuthCtx{"alice"});
     return Server::HandlerResponse::Unhandled;
   });
 
   svr.Get("/me", [](const Request & /*req*/, Response &res) {
-    auto *ctx = httplib::any_cast<AuthCtx>(&res.user_data["auth"]);
+    auto *ctx = res.user_data.get<AuthCtx>("auth");
     ASSERT_NE(nullptr, ctx);
     res.set_content("Hello " + ctx->user_id, "text/plain");
   });
@@ -3203,12 +3198,12 @@ TEST(RequestHandlerTest, ResponseUserDataInPreRequest) {
   Server svr;
 
   svr.set_pre_request_handler([](const Request & /*req*/, Response &res) {
-    res.user_data["role"] = RoleCtx{"admin"};
+    res.user_data.set("role", RoleCtx{"admin"});
     return Server::HandlerResponse::Unhandled;
   });
 
   svr.Get("/role", [](const Request & /*req*/, Response &res) {
-    auto *ctx = httplib::any_cast<RoleCtx>(&res.user_data["role"]);
+    auto *ctx = res.user_data.get<RoleCtx>("role");
     ASSERT_NE(nullptr, ctx);
     res.set_content(ctx->role, "text/plain");
   });
@@ -3851,6 +3846,17 @@ protected:
                EXPECT_EQ("value1", req.get_param_value("array", 0));
                EXPECT_EQ("value2", req.get_param_value("array", 1));
                EXPECT_EQ("value3", req.get_param_value("array", 2));
+             })
+        .Get("/array-param-values",
+             [&](const Request &req, Response & /*res*/) {
+               auto values = req.get_param_values("array");
+               EXPECT_EQ(3u, values.size());
+               EXPECT_EQ("value1", values[0]);
+               EXPECT_EQ("value2", values[1]);
+               EXPECT_EQ("value3", values[2]);
+
+               auto empty = req.get_param_values("nonexistent");
+               EXPECT_TRUE(empty.empty());
              })
         .Post("/validate-no-multiple-headers",
               [&](const Request &req, Response & /*res*/) {
@@ -5973,6 +5979,13 @@ TEST_F(ServerTest, URL) {
 
 TEST_F(ServerTest, ArrayParam) {
   auto res = cli_.Get("/array-param?array=value1&array=value2&array=value3");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+
+TEST_F(ServerTest, ArrayParamValues) {
+  auto res =
+      cli_.Get("/array-param-values?array=value1&array=value2&array=value3");
   ASSERT_TRUE(res);
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
@@ -12397,6 +12410,38 @@ TEST(RedirectTest, RedirectToUrlWithPlusInQueryParameters) {
   }
 }
 
+TEST(RedirectTest, RedirectWithPlusInPath) {
+  Server svr;
+
+  svr.Get("/", [](const Request & /*req*/, Response &res) {
+    res.set_redirect("/a+b");
+  });
+
+  // Route pattern uses regex; escape + as \\+
+  svr.Get(R"(/a\+b)", [](const Request &req, Response &res) {
+    res.set_content(req.path, "text/plain");
+  });
+
+  auto thread = std::thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, PORT);
+    cli.set_follow_location(true);
+
+    auto res = cli.Get("/");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("/a+b", res->body);
+  }
+}
+
 #ifdef CPPHTTPLIB_SSL_ENABLED
 TEST(RedirectTest, Issue2185_Online) {
   SSLClient client("github.com");
@@ -12675,6 +12720,196 @@ TEST(PathParamsTest, SemicolonInTheMiddleIsNotAParam) {
 
   const std::unordered_map<std::string, std::string> expected_params = {};
   EXPECT_EQ(request.path_params, expected_params);
+}
+
+TEST(ParseUrlTest, VariousPatterns) {
+  {
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("http://example.com:8080/path?q=1#frag", uc));
+    EXPECT_EQ("http", uc.scheme);
+    EXPECT_EQ("example.com", uc.host);
+    EXPECT_EQ("8080", uc.port);
+    EXPECT_EQ("/path", uc.path);
+    EXPECT_EQ("?q=1", uc.query);
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("https://example.com/path", uc));
+    EXPECT_EQ("https", uc.scheme);
+    EXPECT_EQ("example.com", uc.host);
+    EXPECT_TRUE(uc.port.empty());
+    EXPECT_EQ("/path", uc.path);
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("http://[::1]:8080/path", uc));
+    EXPECT_EQ("::1", uc.host);
+    EXPECT_EQ("8080", uc.port);
+    EXPECT_EQ("/path", uc.path);
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_FALSE(detail::parse_url("http://[::1/path", uc));
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("//example.com/path?q=1", uc));
+    EXPECT_TRUE(uc.scheme.empty());
+    EXPECT_EQ("example.com", uc.host);
+    EXPECT_EQ("/path", uc.path);
+    EXPECT_EQ("?q=1", uc.query);
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("/path?q=1", uc));
+    EXPECT_TRUE(uc.host.empty());
+    EXPECT_EQ("/path", uc.path);
+    EXPECT_EQ("?q=1", uc.query);
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("example.com:8080", uc));
+    EXPECT_EQ("example.com", uc.host);
+    EXPECT_EQ("8080", uc.port);
+  }
+  {
+    // Unix socket path — must not be parsed as host
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("./httplib-server.sock", uc));
+    EXPECT_TRUE(uc.host.empty());
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("", uc));
+    EXPECT_TRUE(uc.host.empty());
+    EXPECT_TRUE(uc.path.empty());
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_FALSE(detail::parse_url("HTTP://example.com/path", uc));
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_FALSE(detail::parse_url("h2://example.com/path", uc));
+  }
+  {
+    // Accepted by parse_url; callers restrict to http/https
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("ftp://example.com/", uc));
+    EXPECT_EQ("ftp", uc.scheme);
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_FALSE(detail::parse_url("http://[::1<script>]/path", uc));
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_FALSE(detail::parse_url("http://[]/path", uc));
+  }
+}
+
+TEST(ParseUrlTest, FragmentHandling) {
+  {
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("http://example.com/path#frag", uc));
+    EXPECT_EQ("/path", uc.path);
+    EXPECT_TRUE(uc.query.empty());
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("#frag", uc));
+    EXPECT_TRUE(uc.path.empty());
+    EXPECT_TRUE(uc.query.empty());
+  }
+}
+
+TEST(ParseUrlTest, UserinfoHandling) {
+  // Userinfo with @ but no colon — host includes @
+  detail::UrlComponents uc;
+  ASSERT_TRUE(detail::parse_url("http://user@host.com/path", uc));
+  EXPECT_EQ("user@host.com", uc.host);
+  EXPECT_EQ("/path", uc.path);
+}
+
+TEST(ParseUrlTest, IPv6EdgeCases) {
+  {
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("[::1]:8080", uc));
+    EXPECT_TRUE(uc.scheme.empty());
+    EXPECT_EQ("::1", uc.host);
+    EXPECT_EQ("8080", uc.port);
+  }
+  {
+    // Zone ID '%25' is not in [a-fA-F0-9:]
+    detail::UrlComponents uc;
+    ASSERT_FALSE(detail::parse_url("http://[fe80::1%25eth0]:443/path", uc));
+  }
+}
+
+TEST(ParseUrlTest, SchemeEdgeCases) {
+  {
+    detail::UrlComponents uc;
+    ASSERT_FALSE(detail::parse_url("://evil.com/path", uc));
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_FALSE(detail::parse_url("ht-tp://evil.com/path", uc));
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_FALSE(detail::parse_url("h.t://evil.com/path", uc));
+  }
+}
+
+TEST(ParseUrlTest, PortEdgeCases) {
+  {
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("http://example.com:/path", uc));
+    EXPECT_TRUE(uc.port.empty());
+    EXPECT_EQ("/path", uc.path);
+  }
+  {
+    // parse_url accepts any port string; validation is done by parse_port
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("http://example.com:abc/path", uc));
+    EXPECT_EQ("abc", uc.port);
+  }
+}
+
+TEST(ParseUrlTest, WebSocketPatterns) {
+  {
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("ws://echo.example.com:8080/ws", uc));
+    EXPECT_EQ("ws", uc.scheme);
+    EXPECT_EQ("echo.example.com", uc.host);
+    EXPECT_EQ("8080", uc.port);
+    EXPECT_EQ("/ws", uc.path);
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("wss://echo.example.com/ws", uc));
+    EXPECT_EQ("wss", uc.scheme);
+    EXPECT_EQ("echo.example.com", uc.host);
+    EXPECT_TRUE(uc.port.empty());
+    EXPECT_EQ("/ws", uc.path);
+  }
+}
+
+TEST(ParseUrlTest, QueryOnly) {
+  detail::UrlComponents uc;
+  ASSERT_TRUE(detail::parse_url("?q=1&r=2", uc));
+  EXPECT_TRUE(uc.host.empty());
+  EXPECT_TRUE(uc.path.empty());
+  EXPECT_EQ("?q=1&r=2", uc.query);
+}
+
+TEST(ParseUrlTest, SchemeRelativeWithPort) {
+  detail::UrlComponents uc;
+  ASSERT_TRUE(detail::parse_url("//example.com:443/path", uc));
+  EXPECT_TRUE(uc.scheme.empty());
+  EXPECT_EQ("example.com", uc.host);
+  EXPECT_EQ("443", uc.port);
+  EXPECT_EQ("/path", uc.path);
 }
 
 TEST(UniversalClientImplTest, Ipv6LiteralAddress) {
