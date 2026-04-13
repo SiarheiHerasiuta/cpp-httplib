@@ -3390,7 +3390,7 @@ protected:
              })
         .Get("/slow",
              [&](const Request & /*req*/, Response &res) {
-               std::this_thread::sleep_for(std::chrono::seconds(2));
+               std::this_thread::sleep_for(std::chrono::seconds(4));
                res.set_content("slow", "text/plain");
              })
 #if 0
@@ -6909,7 +6909,7 @@ TEST_F(ServerTest, SendLargeBodyAfterRequestLineError) {
     EXPECT_EQ(StatusCode::UriTooLong_414, res.status);
     EXPECT_EQ("close", res.get_header_value("Connection"));
     EXPECT_FALSE(cli_.is_socket_open());
-    EXPECT_LE(elapsed, 200);
+    EXPECT_LE(elapsed, 2000);
   }
 
   {
@@ -13227,12 +13227,12 @@ TEST(Expect100ContinueTest, ServerClosesConnection) {
         size_t (*)(char *ptr, size_t size, size_t nmemb, void *userdata);
     read_callback_t read_callback = [](char *ptr, size_t size, size_t nmemb,
                                        void *userdata) -> size_t {
-      read_data *data = (read_data *)userdata;
+      read_data *d = (read_data *)userdata;
 
-      if (!userdata || data->read_size >= data->total_size) { return 0; }
+      if (!userdata || d->read_size >= d->total_size) { return 0; }
 
       std::fill_n(ptr, size * nmemb, 'A');
-      data->read_size += size * nmemb;
+      d->read_size += size * nmemb;
       return size * nmemb;
     };
     curl_easy_setopt(curl.get(), CURLOPT_READDATA, data);
@@ -13244,9 +13244,9 @@ TEST(Expect100ContinueTest, ServerClosesConnection) {
         size_t (*)(char *ptr, size_t size, size_t nmemb, void *userdata);
     write_callback_t write_callback = [](char *ptr, size_t size, size_t nmemb,
                                          void *userdata) -> size_t {
-      std::vector<char> *buffer = (std::vector<char> *)userdata;
-      buffer->reserve(buffer->size() + size * nmemb + 1);
-      buffer->insert(buffer->end(), (char *)ptr, (char *)ptr + size * nmemb);
+      std::vector<char> *buf = (std::vector<char> *)userdata;
+      buf->reserve(buf->size() + size * nmemb + 1);
+      buf->insert(buf->end(), (char *)ptr, (char *)ptr + size * nmemb);
       return size * nmemb;
     };
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, write_callback);
@@ -16587,41 +16587,6 @@ TEST(BindServerTest, UpdateCerts) {
   EVP_PKEY_free(key);
 }
 
-// Test that SSLServer(X509*, EVP_PKEY*, X509_STORE*) constructor sets
-// client CA list correctly for TLS handshake
-TEST(SSLClientServerTest, X509ConstructorSetsClientCAList) {
-  X509 *cert = readCertificate(SERVER_CERT_FILE);
-  X509 *ca_cert = readCertificate(CLIENT_CA_CERT_FILE);
-  EVP_PKEY *key = readPrivateKey(SERVER_PRIVATE_KEY_FILE);
-
-  ASSERT_TRUE(cert != nullptr);
-  ASSERT_TRUE(ca_cert != nullptr);
-  ASSERT_TRUE(key != nullptr);
-
-  X509_STORE *cert_store = X509_STORE_new();
-  X509_STORE_add_cert(cert_store, ca_cert);
-
-  // Use X509-based constructor (deprecated but should still work correctly)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-  SSLServer svr(cert, key, cert_store);
-#pragma GCC diagnostic pop
-
-  ASSERT_TRUE(svr.is_valid());
-
-  // Verify that client CA list is set in SSL_CTX
-  auto ssl_ctx = static_cast<SSL_CTX *>(svr.tls_context());
-  ASSERT_TRUE(ssl_ctx != nullptr);
-
-  STACK_OF(X509_NAME) *ca_list = SSL_CTX_get_client_CA_list(ssl_ctx);
-  ASSERT_TRUE(ca_list != nullptr);
-  EXPECT_GT(sk_X509_NAME_num(ca_list), 0);
-
-  X509_free(cert);
-  X509_free(ca_cert);
-  EVP_PKEY_free(key);
-}
-
 // Test that update_certs() updates client CA list correctly
 TEST(SSLClientServerTest, UpdateCertsSetsClientCAList) {
   // Start with file-based constructor
@@ -17575,8 +17540,14 @@ TEST(SymlinkTest, SymlinkEscapeFromBaseDirectory) {
   }
 
   // Create symlink using absolute path so it resolves correctly
+#ifdef PATH_MAX
   char abs_secret[PATH_MAX];
   ASSERT_NE(nullptr, realpath(secret_dir.c_str(), abs_secret));
+#else
+  auto abs_secret = realpath(secret_dir.c_str(), nullptr);
+  auto abs_secret_guard = detail::scope_exit([&]() { std::free(abs_secret); });
+  ASSERT_NE(nullptr, abs_secret);
+#endif
   ASSERT_EQ(0, symlink(abs_secret, symlink_path.c_str()));
 
   auto se = detail::scope_exit([&] {

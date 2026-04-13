@@ -8,7 +8,7 @@ It's extremely easy to set up. Just include the **[httplib.h](https://raw.github
 Learn more in the [official documentation](https://yhirose.github.io/cpp-httplib/) (built with [docs-gen](https://github.com/yhirose/docs-gen)).
 
 > [!IMPORTANT]
-> This library uses 'blocking' socket I/O. If you are looking for a library with 'non-blocking' socket I/O, this is not the one that you want.
+> This library uses 'blocking' socket I/O. If you are looking for a library with 'non-blocking' socket I/O, this is not the one that you want. Only **HTTP/1.1** is supported — HTTP/2 and HTTP/3 are not implemented.
 
 > [!WARNING]
 > 32-bit platforms are **NOT supported**. Use at your own risk. The library may compile on 32-bit targets, but no security review has been conducted for 32-bit environments. Integer truncation and other 32-bit-specific issues may exist. **Security reports that only affect 32-bit platforms will be closed without action.** The maintainer does not have access to 32-bit environments for testing or fixing issues. CI includes basic compile checks only, not functional or security testing.
@@ -191,7 +191,7 @@ cpp-httplib automatically integrates with the OS certificate store on macOS and 
 
 | Platform | Behavior | Disable (compile time) |
 | :------- | :------- | :--------------------- |
-| macOS | Loads system certs from Keychain (link `CoreFoundation` and `Security` with `-framework`) | `CPPHTTPLIB_DISABLE_MACOSX_AUTOMATIC_ROOT_CERTIFICATES` |
+| macOS | Loads system certs from Keychain (link `CoreFoundation` and `Security` with `-framework`). Requires Apple Clang; GCC is not supported for this feature. | `CPPHTTPLIB_DISABLE_MACOSX_AUTOMATIC_ROOT_CERTIFICATES` |
 | Windows | Verifies certs via CryptoAPI (`CertGetCertificateChain` / `CertVerifyCertificateChainPolicy`) with revocation checking | `CPPHTTPLIB_DISABLE_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE` |
 
 On Windows, verification can also be disabled at runtime:
@@ -239,6 +239,8 @@ int main(void)
     if (req.has_param("key")) {
       auto val = req.get_param_value("key");
     }
+    // Get all values for a given key (e.g., ?tag=a&tag=b)
+    auto values = req.get_param_values("tag");
     res.set_content(req.body, "text/plain");
   });
 
@@ -741,6 +743,10 @@ svr.set_keep_alive_timeout(10);  // Default is 5
 svr.set_read_timeout(5, 0); // 5 seconds
 svr.set_write_timeout(5, 0); // 5 seconds
 svr.set_idle_interval(0, 100000); // 100 milliseconds
+
+// std::chrono is also supported
+svr.set_read_timeout(std::chrono::seconds(5));
+svr.set_keep_alive_timeout(std::chrono::seconds(10));
 ```
 
 ### Set maximum payload length for reading a request body
@@ -1051,6 +1057,12 @@ cli.set_write_timeout(5, 0); // 5 seconds
 
 // This method works the same as curl's `--max-time` option
 cli.set_max_timeout(5000); // 5 seconds
+
+// std::chrono is also supported
+cli.set_connection_timeout(std::chrono::milliseconds(300));
+cli.set_read_timeout(std::chrono::seconds(5));
+cli.set_write_timeout(std::chrono::seconds(5));
+cli.set_max_timeout(std::chrono::seconds(5));
 ```
 
 ### Set maximum payload length for reading a response body
@@ -1450,9 +1462,25 @@ if (ws.connect()) {
 
 SSL is also supported via `wss://` scheme (e.g. `WebSocketClient("wss://example.com/ws")`). Subprotocol negotiation (`Sec-WebSocket-Protocol`) is supported via `SubProtocolSelector` callback.
 
-> **Note:** WebSocket connections occupy a thread for their entire lifetime. If you plan to handle many simultaneous WebSocket connections, consider using a dynamic thread pool: `svr.new_task_queue = [] { return new ThreadPool(8, 64); };`
+> **Note:** WebSocket connections occupy a thread for their entire lifetime (plus an additional thread per connection for heartbeat pings). This thread-per-connection model is intended for small- to mid-scale workloads; large numbers of simultaneous WebSocket connections are outside the design target of this library. If you expect many concurrent WebSocket clients, configure a dynamic thread pool (`svr.new_task_queue = [] { return new ThreadPool(8, 64); };`) and measure carefully.
+
+> **WebSocket extensions are not supported.** `permessage-deflate` and other RFC 6455 extensions are not implemented. If a client proposes them via `Sec-WebSocket-Extensions`, the server silently declines them in its handshake response.
+
+> **Unresponsive-peer detection.** Heartbeat pings also serve as a liveness probe when `set_websocket_max_missed_pongs(n)` is set: if the client sends `n` consecutive pings without receiving a pong, it will close the connection. Disabled by default (`0`).
 
 See [README-websocket.md](README-websocket.md) for more details.
+
+## Socket Option Utility
+
+`set_socket_opt` is a convenience wrapper around `setsockopt` for setting integer socket options:
+
+```cpp
+auto sock = svr.socket();
+httplib::set_socket_opt(sock, IPPROTO_TCP, TCP_NODELAY, 1);
+```
+
+> [!TIP]
+> For most use cases, prefer `set_tcp_nodelay(true)` or `set_socket_options(callback)` on the Server/Client instead of calling `set_socket_opt` directly.
 
 ## Split httplib.h into .h and .cc
 
