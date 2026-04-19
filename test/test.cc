@@ -14275,8 +14275,23 @@ static std::thread serve_single_response(std::promise<int> &port_promise,
     auto cli = ::accept(srv, reinterpret_cast<sockaddr *>(&cli_addr), &cli_len);
 
     if (cli != INVALID_SOCKET) {
-      char buf[4096];
-      ::recv(cli, buf, sizeof(buf), 0);
+      // Read the complete HTTP request (until the blank line that terminates
+      // headers) before sending the response.  If the server closes the socket
+      // while the client's request data is still unread in the kernel receive
+      // buffer, the TCP stack sends RST instead of FIN.  That RST resets the
+      // connection on both sides: it discards the client's receive buffer
+      // (which already holds our response) and causes any in-progress write on
+      // the client to fail with ECONNRESET.  Reading all request data first
+      // ensures close() emits a graceful FIN.
+      {
+        char rbuf[256];
+        std::string req;
+        while (req.find("\r\n\r\n") == std::string::npos) {
+          auto n = ::recv(cli, rbuf, sizeof(rbuf), 0);
+          if (n <= 0) { break; }
+          req.append(rbuf, static_cast<size_t>(n));
+        }
+      }
 
       ::send(cli,
 #ifdef _WIN32
@@ -14470,6 +14485,48 @@ TEST_F(SSLOpenStreamTest, PostChunked) {
 
   auto body = read_all(handle);
   EXPECT_EQ("Chunked SSL Data", body);
+}
+
+// RFC 7230 §3.3: a response body with neither chunked Transfer-Encoding nor
+// Content-Length is terminated by the server closing the connection.  When the
+// SSL peer sends a close_notify after the body, the client must treat it as a
+// clean EOF and return a successful response rather than an error.
+TEST(SSLTest, ResponseBodyTerminatedByConnectionClose) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+
+  svr.set_keep_alive_max_count(1);
+
+  const std::string expected_body = "Hello from connection-close response!";
+
+  svr.Get("/no-content-length", [&](const Request & /*req*/, Response &res) {
+    res.set_content_provider("text/plain",
+                             [&](size_t offset, DataSink &sink) -> bool {
+                               if (offset < expected_body.size()) {
+                                 sink.write(expected_body.data() + offset,
+                                            expected_body.size() - offset);
+                               }
+                               sink.done();
+                               return true;
+                             });
+  });
+
+  auto listen_thread = std::thread([&svr] { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  SSLClient cli(HOST, PORT);
+  cli.enable_server_certificate_verification(false);
+
+  auto res = cli.Get("/no-content-length");
+
+  ASSERT_TRUE(res) << "Request failed: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ(expected_body, res->body);
 }
 #endif // CPPHTTPLIB_SSL_ENABLED
 
