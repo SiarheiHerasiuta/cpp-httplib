@@ -67,22 +67,29 @@ SHARDS ?= 4
 
 define run_parallel
 	@echo "Running $(1) with $(SHARDS) shards in parallel..."
-	@fail=0; \
+	@fail=0; pids=""; \
 	for i in $$(seq 0 $$(($(SHARDS) - 1))); do \
 	  GTEST_TOTAL_SHARDS=$(SHARDS) GTEST_SHARD_INDEX=$$i \
 	  LSAN_OPTIONS=suppressions=lsan_suppressions.txt \
 	  $(SETARCH) ./$(1) --gtest_color=yes > $(1)_shard_$$i.log 2>&1 & \
+	  pids="$$pids $$!"; \
 	done; \
-	wait; \
-	for i in $$(seq 0 $$(($(SHARDS) - 1))); do \
-	  if ! grep -q "\[  PASSED  \]" $(1)_shard_$$i.log; then \
-	    echo "=== Shard $$i FAILED ==="; \
-	    cat $(1)_shard_$$i.log; \
-	    fail=1; \
-	  else \
-	    passed=$$(grep "\[  PASSED  \]" $(1)_shard_$$i.log); \
+	exits=""; \
+	for pid in $$pids; do \
+	  wait $$pid; exits="$$exits $$?"; \
+	done; \
+	i=0; \
+	for ec in $$exits; do \
+	  log=$(1)_shard_$$i.log; \
+	  if grep -q "\[  PASSED  \]" $$log && ! grep -q "\[  FAILED  \]" $$log && [ $$ec -eq 0 ]; then \
+	    passed=$$(grep "\[  PASSED  \]" $$log); \
 	    echo "Shard $$i: $$passed"; \
+	  else \
+	    echo "=== Shard $$i FAILED (exit=$$ec) ==="; \
+	    cat $$log; \
+	    fail=1; \
 	  fi; \
+	  i=$$((i+1)); \
 	done; \
 	if [ $$fail -ne 0 ]; then exit 1; fi; \
 	echo "All shards passed."
