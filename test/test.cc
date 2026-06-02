@@ -10673,8 +10673,20 @@ TEST(SSLClientServerTest, TlsVerifyHostname) {
       << "Verify callback should have been called";
 
   // CN="Common Name" should match our test certificate
+  //
+  // BoringSSL intentionally drops CN-based hostname matching per RFC 6125
+  // §6.4.4 — only SubjectAltName is consulted. Other backends (OpenSSL,
+  // MbedTLS, wolfSSL) still honor the CN fallback, so flip the expectation
+  // for BoringSSL builds. OPENSSL_IS_BORINGSSL is defined by BoringSSL's
+  // <openssl/base.h>, which is included transitively when
+  // CPPHTTPLIB_OPENSSL_SUPPORT is set against a BoringSSL install.
+#if defined(OPENSSL_IS_BORINGSSL)
+  EXPECT_FALSE(verify_result_cn)
+      << "BoringSSL should reject CN-based hostname matching (SAN-only)";
+#else
   EXPECT_TRUE(verify_result_cn)
       << "verify_hostname should match 'Common Name' (certificate CN)";
+#endif
 
   // Wrong hostname should not match
   EXPECT_FALSE(verify_result_wrong)
@@ -13660,6 +13672,110 @@ TEST(Expect100ContinueTest, ServerClosesConnection) {
       ASSERT_STRCASEEQ(buffer.data(), reject);
     }
   }
+}
+#endif
+
+#if defined(CPPHTTPLIB_OPENSSL_SUPPORT) && !defined(_WIN32)
+// Regression test for #2458.
+//
+// A large request body (>= CPPHTTPLIB_EXPECT_100_THRESHOLD) makes the client
+// auto-add `Expect: 100-continue`. Over TLS, the server's TLS 1.3 session
+// ticket can make the client socket spuriously readable during the
+// 100-continue wait. If the readiness is mistaken for an incoming response,
+// the client withholds the body and then blocks reading a response that never
+// comes, failing with `Failed to read connection`.
+//
+// A correct client (like curl) sends the body once no `100 Continue` arrives
+// within the timeout. This raw OpenSSL server deliberately never sends
+// `100 Continue`; the client must still deliver the body and receive 200.
+TEST(Expect100ContinueTest, TLSServerOmits100Continue) {
+  signal(SIGPIPE, SIG_IGN);
+
+  const auto port = PORT + 4;
+
+  auto srv = ::socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_NE(srv, INVALID_SOCKET);
+
+  int opt = 1;
+  ::setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(port));
+  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+  ASSERT_EQ(0, ::bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
+  ASSERT_EQ(0, ::listen(srv, 1));
+
+  std::atomic<size_t> server_body_bytes{0};
+
+  auto server_thread = std::thread([&] {
+    sockaddr_in cli_addr{};
+    socklen_t cli_len = sizeof(cli_addr);
+    auto cli = ::accept(srv, reinterpret_cast<sockaddr *>(&cli_addr), &cli_len);
+    if (cli == INVALID_SOCKET) { return; }
+
+    // Bound the lifetime of the server side so a buggy client (which never
+    // sends the body) cannot make this thread block forever on join.
+    detail::set_socket_opt_time(cli, SOL_SOCKET, SO_RCVTIMEO, 4, 0);
+
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+    SSL_CTX_use_certificate_file(ctx, SERVER_CERT_FILE, SSL_FILETYPE_PEM);
+    SSL_CTX_use_PrivateKey_file(ctx, SERVER_PRIVATE_KEY_FILE, SSL_FILETYPE_PEM);
+
+    SSL *ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, static_cast<int>(cli));
+
+    if (SSL_accept(ssl) > 0) {
+      // Read the request headers. Reading here also flushes the TLS 1.3
+      // session tickets to the client. Deliberately do NOT send
+      // `100 Continue`.
+      std::string buf;
+      char tmp[1024];
+      while (buf.find("\r\n\r\n") == std::string::npos) {
+        auto n = SSL_read(ssl, tmp, sizeof(tmp));
+        if (n <= 0) { break; }
+        buf.append(tmp, static_cast<size_t>(n));
+      }
+
+      // A correct client sends the body now; count what arrives.
+      auto pos = buf.find("\r\n\r\n");
+      size_t body = (pos == std::string::npos) ? 0 : buf.size() - (pos + 4);
+      while (body < 4096) {
+        auto n = SSL_read(ssl, tmp, sizeof(tmp));
+        if (n <= 0) { break; }
+        body += static_cast<size_t>(n);
+      }
+      server_body_bytes = body;
+
+      std::string resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+      SSL_write(ssl, resp.data(), static_cast<int>(resp.size()));
+      SSL_shutdown(ssl);
+    }
+
+    SSL_free(ssl);
+    detail::close_socket(cli);
+    SSL_CTX_free(ctx);
+  });
+
+  auto se = detail::scope_exit([&] {
+    server_thread.join();
+    detail::close_socket(srv);
+  });
+
+  SSLClient cli("127.0.0.1", port);
+  cli.enable_server_certificate_verification(false);
+  cli.set_connection_timeout(5, 0);
+  cli.set_read_timeout(3, 0); // short, so a hang surfaces quickly
+
+  // Body larger than CPPHTTPLIB_EXPECT_100_THRESHOLD (1024) -> auto Expect.
+  std::string body(4096, 'A');
+  auto res = cli.Put("/api/test", body, "application/json");
+
+  ASSERT_TRUE(res) << "request failed: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ(body.size(), server_body_bytes.load());
 }
 #endif
 
@@ -18264,3 +18380,777 @@ TEST(KeepAliveTest, DeleteWithoutContentLengthDoesNotEatNextRequest) {
 
   EXPECT_EQ(2, delete_count.load());
 }
+
+namespace no_proxy_test {
+
+// Server bound to 127.0.0.1:<dynamic>, listen thread spawned by listen(),
+// auto-stopped + joined on scope exit. Register handlers via svr() BEFORE
+// calling listen().
+class ScopedServer {
+public:
+  ScopedServer() { port_ = svr_.bind_to_any_port("127.0.0.1"); }
+  ~ScopedServer() {
+    svr_.stop();
+    if (th_.joinable()) { th_.join(); }
+  }
+  Server &svr() { return svr_; }
+  int port() const { return port_; }
+  void listen() {
+    th_ = std::thread([this] { svr_.listen_after_bind(); });
+    svr_.wait_until_ready();
+  }
+
+private:
+  Server svr_;
+  std::thread th_;
+  int port_ = 0;
+};
+
+class ProxyAndTargetServers {
+public:
+  ProxyAndTargetServers() {
+    proxy_mock_.Get(".*", [this](const Request &req, Response &res) {
+      proxy_hits_++;
+      last_had_proxy_authz_ = req.has_header("Proxy-Authorization");
+      res.set_content("via-proxy", "text/plain");
+    });
+    target_.Get(".*", [this](const Request &req, Response &res) {
+      target_hits_++;
+      last_had_proxy_authz_ = req.has_header("Proxy-Authorization");
+      res.set_content("direct", "text/plain");
+    });
+
+    proxy_port_ = proxy_mock_.bind_to_any_port("127.0.0.1");
+    target_port_ = target_.bind_to_any_port("127.0.0.1");
+    proxy_thread_ = std::thread([this] { proxy_mock_.listen_after_bind(); });
+    target_thread_ = std::thread([this] { target_.listen_after_bind(); });
+    proxy_mock_.wait_until_ready();
+    target_.wait_until_ready();
+  }
+
+  ~ProxyAndTargetServers() {
+    proxy_mock_.stop();
+    target_.stop();
+    if (proxy_thread_.joinable()) { proxy_thread_.join(); }
+    if (target_thread_.joinable()) { target_thread_.join(); }
+  }
+
+  Server &proxy_mock() { return proxy_mock_; }
+  Server &target() { return target_; }
+  int proxy_port() const { return proxy_port_; }
+  int target_port() const { return target_port_; }
+  int proxy_hits() const { return proxy_hits_.load(); }
+  int target_hits() const { return target_hits_.load(); }
+  bool last_had_proxy_authz() const { return last_had_proxy_authz_.load(); }
+
+  void reset_counters() {
+    proxy_hits_ = 0;
+    target_hits_ = 0;
+    last_had_proxy_authz_ = false;
+  }
+
+private:
+  Server proxy_mock_;
+  Server target_;
+  std::thread proxy_thread_;
+  std::thread target_thread_;
+  int proxy_port_ = 0;
+  int target_port_ = 0;
+  std::atomic<int> proxy_hits_{0};
+  std::atomic<int> target_hits_{0};
+  std::atomic<bool> last_had_proxy_authz_{false};
+};
+
+inline std::unique_ptr<Client> make_client(const std::string &host,
+                                           ProxyAndTargetServers &s) {
+  auto cli = detail::make_unique<Client>(host, s.target_port());
+  cli->set_hostname_addr_map({{host, "127.0.0.1"}});
+  cli->set_proxy("127.0.0.1", s.proxy_port());
+  return cli;
+}
+
+} // namespace no_proxy_test
+
+using no_proxy_test::make_client;
+using no_proxy_test::ProxyAndTargetServers;
+
+TEST(NoProxyTest, ExactHostnameBypasses) {
+  ProxyAndTargetServers s;
+  auto cli = make_client("example.com", s);
+  cli->set_no_proxy({"example.com"});
+
+  auto res = cli->Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, SubdomainBypasses) {
+  ProxyAndTargetServers s;
+  auto cli = make_client("foo.example.com", s);
+  cli->set_no_proxy({"example.com"});
+
+  auto res = cli->Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, EvilExampleDoesNotMatchExample) {
+  // Regression guard: "evilexample.com" must not be considered a subdomain
+  // of "example.com". Without the dot-boundary rule, a naive endsWith
+  // check would let traffic bypass the proxy and leak credentials direct
+  // to the attacker host.
+  ProxyAndTargetServers s;
+  auto cli = make_client("evilexample.com", s);
+  cli->set_no_proxy({"example.com"});
+
+  auto res = cli->Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_GE(s.proxy_hits(), 1);
+  EXPECT_EQ(0, s.target_hits());
+}
+
+TEST(NoProxyTest, ExampleDotEvilDoesNotMatchExample) {
+  ProxyAndTargetServers s;
+  auto cli = make_client("example.com.evil.com", s);
+  cli->set_no_proxy({"example.com"});
+
+  auto res = cli->Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_GE(s.proxy_hits(), 1);
+  EXPECT_EQ(0, s.target_hits());
+}
+
+TEST(NoProxyTest, LeadingDotPatternMatchesBareDomain) {
+  ProxyAndTargetServers s;
+  auto cli = make_client("example.com", s);
+  cli->set_no_proxy({".example.com"});
+
+  auto res = cli->Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, CaseInsensitiveHostname) {
+  ProxyAndTargetServers s;
+  auto cli = make_client("Example.COM", s);
+  cli->set_no_proxy({"EXAMPLE.com"});
+
+  auto res = cli->Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, TrailingDotIsNormalized) {
+  ProxyAndTargetServers s;
+  auto cli = make_client("example.com.", s);
+  cli->set_no_proxy({"example.com"});
+
+  auto res = cli->Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, TrailingDotOnEntryIsNormalized) {
+  // Trailing dots must be normalized on BOTH sides — host and entry.
+  // An implementation that only strips the host-side trailing dot would
+  // fail to match host "example.com" against entry "example.com." because
+  // a literal substring search would compare 11 chars against 12.
+  ProxyAndTargetServers s;
+  auto cli = make_client("example.com", s);
+  cli->set_no_proxy({"example.com."});
+
+  auto res = cli->Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, WildcardBypassesEverything) {
+  ProxyAndTargetServers s;
+  auto cli = make_client("anything.invalid.test", s);
+  cli->set_no_proxy({"*"});
+
+  auto res = cli->Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, IPv4LiteralExactMatch) {
+  ProxyAndTargetServers s;
+  Client cli("127.0.0.1", s.target_port());
+  cli.set_proxy("127.0.0.1", s.proxy_port());
+  cli.set_no_proxy({"127.0.0.1"});
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, IPv6LiteralExactMatchAcrossEquivalentForms) {
+  ProxyAndTargetServers s;
+  Client cli("0:0:0:0:0:0:0:1", s.target_port());
+  cli.set_hostname_addr_map({{"0:0:0:0:0:0:0:1", "127.0.0.1"}});
+  cli.set_proxy("127.0.0.1", s.proxy_port());
+  cli.set_no_proxy({"::1"});
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, BareIPv6LiteralMatchesIPv6Cidr) {
+  // Regression guard: a bare IPv6 host literal (no surrounding brackets)
+  // must still be recognized as IPv6 for CIDR matching. Implementations
+  // that detect IPv6 only when the host begins with '[' would parse the
+  // host as a hostname and miss the match.
+  ProxyAndTargetServers s;
+  Client cli("fe80::1", s.target_port());
+  cli.set_hostname_addr_map({{"fe80::1", "127.0.0.1"}});
+  cli.set_proxy("127.0.0.1", s.proxy_port());
+  cli.set_no_proxy({"fe80::/10"});
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, BracketedIPv6EntryAccepted) {
+  ProxyAndTargetServers s;
+  Client cli("::1", s.target_port());
+  cli.set_hostname_addr_map({{"::1", "127.0.0.1"}});
+  cli.set_proxy("127.0.0.1", s.proxy_port());
+  cli.set_no_proxy({"[::1]"});
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, BracketedIPv6CidrEntryAccepted) {
+  ProxyAndTargetServers s;
+  Client cli("fe80::1", s.target_port());
+  cli.set_hostname_addr_map({{"fe80::1", "127.0.0.1"}});
+  cli.set_proxy("127.0.0.1", s.proxy_port());
+  cli.set_no_proxy({"[fe80::]/10"});
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, IPv4MappedIPv6IsNotCrossMatchedAgainstIPv4Entry) {
+  // Policy: keep address families separate. "::ffff:1.2.3.4" must NOT
+  // satisfy a NO_PROXY entry of "1.2.3.4". This avoids subtle bypass
+  // tricks via address-family conversion.
+  ProxyAndTargetServers s;
+  Client cli("::ffff:127.0.0.1", s.target_port());
+  cli.set_hostname_addr_map({{"::ffff:127.0.0.1", "127.0.0.1"}});
+  cli.set_proxy("127.0.0.1", s.proxy_port());
+  cli.set_no_proxy({"127.0.0.1"});
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_GE(s.proxy_hits(), 1);
+  EXPECT_EQ(0, s.target_hits());
+}
+
+TEST(NoProxyTest, IPv4CidrMatch) {
+  ProxyAndTargetServers s;
+  Client cli("127.0.0.1", s.target_port());
+  cli.set_proxy("127.0.0.1", s.proxy_port());
+  cli.set_no_proxy({"127.0.0.0/8"});
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, IPv4CidrNonMatch) {
+  ProxyAndTargetServers s;
+  Client cli("127.0.0.1", s.target_port());
+  cli.set_proxy("127.0.0.1", s.proxy_port());
+  cli.set_no_proxy({"10.0.0.0/8"});
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_GE(s.proxy_hits(), 1);
+  EXPECT_EQ(0, s.target_hits());
+}
+
+TEST(NoProxyTest, IPv4CidrPrefixZeroMatchesAll) {
+  // Prefix 0 must not trigger the (1u << 32) shift UB. Result: every
+  // IPv4 target matches.
+  ProxyAndTargetServers s;
+  Client cli("127.0.0.1", s.target_port());
+  cli.set_proxy("127.0.0.1", s.proxy_port());
+  cli.set_no_proxy({"0.0.0.0/0"});
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, IPv4CidrSingleHostNoSlash) {
+  ProxyAndTargetServers s;
+  Client cli("127.0.0.1", s.target_port());
+  cli.set_proxy("127.0.0.1", s.proxy_port());
+  cli.set_no_proxy({"127.0.0.1"});
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, MalformedCidrPrefixIsDropped) {
+  ProxyAndTargetServers s;
+  Client cli("127.0.0.1", s.target_port());
+  cli.set_proxy("127.0.0.1", s.proxy_port());
+  cli.set_no_proxy({"127.0.0.0/33"});
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_GE(s.proxy_hits(), 1);
+  EXPECT_EQ(0, s.target_hits());
+}
+
+TEST(NoProxyTest, TrailingSlashCidrIsRejected) {
+  // Empty prefix after the slash must be rejected, not silently treated as /32.
+  ProxyAndTargetServers s;
+  Client cli("127.0.0.1", s.target_port());
+  cli.set_proxy("127.0.0.1", s.proxy_port());
+  cli.set_no_proxy({"127.0.0.1/"});
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_GE(s.proxy_hits(), 1);
+  EXPECT_EQ(0, s.target_hits());
+}
+
+TEST(NoProxyTest, ProxyAuthorizationSuppressedWhenBypassed) {
+  ProxyAndTargetServers s;
+  auto cli = make_client("internal.corp", s);
+  cli->set_proxy_basic_auth("u", "p");
+  cli->set_no_proxy({"internal.corp"});
+
+  auto res = cli->Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(1, s.target_hits());
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_FALSE(s.last_had_proxy_authz())
+      << "Proxy-Authorization must not be sent direct to the target";
+}
+
+TEST(NoProxyTest, ProxyAuthorizationSentWhenNotBypassed) {
+  ProxyAndTargetServers s;
+  auto cli = make_client("public.example", s);
+  cli->set_proxy_basic_auth("u", "p");
+  cli->set_no_proxy({"internal.corp"}); // does not match
+
+  auto res = cli->Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_GE(s.proxy_hits(), 1);
+  EXPECT_TRUE(s.last_had_proxy_authz());
+}
+
+TEST(NoProxyTest, EmptyNoProxyKeepsProxyOn) {
+  ProxyAndTargetServers s;
+  auto cli = make_client("anything.test", s);
+
+  auto res = cli->Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_GE(s.proxy_hits(), 1);
+  EXPECT_EQ(0, s.target_hits());
+}
+
+TEST(NoProxyTest, PortSpecificEntryRejected) {
+  ProxyAndTargetServers s;
+  auto cli = make_client("example.com", s);
+  cli->set_no_proxy({"example.com:8080"});
+
+  auto res = cli->Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_GE(s.proxy_hits(), 1);
+  EXPECT_EQ(0, s.target_hits());
+}
+
+TEST(NoProxyTest, EmptyAndWhitespaceEntriesDropped) {
+  ProxyAndTargetServers s;
+  auto cli = make_client("anything.test", s);
+  cli->set_no_proxy({"", "   ", "\t"});
+
+  auto res = cli->Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_GE(s.proxy_hits(), 1);
+  EXPECT_EQ(0, s.target_hits());
+}
+
+TEST(NoProxyTest, ValidEntryWithSurroundingWhitespaceStillMatches) {
+  // An entry with leading/trailing whitespace must still match — env-style
+  // values are commonly pasted with stray spaces and an implementation
+  // that feeds the raw token directly to inet_pton would fail to match
+  // valid CIDRs because of the spaces.
+  ProxyAndTargetServers s;
+  Client cli("127.0.0.1", s.target_port());
+  cli.set_proxy("127.0.0.1", s.proxy_port());
+  cli.set_no_proxy({"  127.0.0.0/8  "});
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(0, s.proxy_hits());
+  EXPECT_EQ(1, s.target_hits());
+}
+
+TEST(NoProxyTest, RedirectToBypassedHostStripsProxyAndProxyAuth) {
+  // Analog of GHSA-6hrp-7fq9-3qv2: redirect to a NO_PROXY-matched host must
+  // go direct and must NOT carry Proxy-Authorization.
+  std::atomic<int> proxy_hits{0};
+  std::atomic<int> target_hits{0};
+  std::atomic<bool> target_saw_authz{false};
+
+  no_proxy_test::ScopedServer proxy_mock, target;
+
+  proxy_mock.svr().Get(".*", [&](const Request &, Response &res) {
+    proxy_hits++;
+    res.status = 302;
+    res.set_header("Location", "http://127.0.0.1:" +
+                                   std::to_string(target.port()) + "/landed");
+  });
+  target.svr().Get(".*", [&](const Request &req, Response &res) {
+    target_hits++;
+    if (req.has_header("Proxy-Authorization")) { target_saw_authz = true; }
+    res.set_content("direct", "text/plain");
+  });
+  proxy_mock.listen();
+  target.listen();
+
+  Client cli("public.example", target.port());
+  cli.set_hostname_addr_map({{"public.example", "127.0.0.1"}});
+  cli.set_proxy("127.0.0.1", proxy_mock.port());
+  cli.set_proxy_basic_auth("u", "p");
+  cli.set_no_proxy({"127.0.0.1"});
+  cli.set_follow_location(true);
+
+  auto res = cli.Get("/redir");
+  ASSERT_TRUE(res);
+  EXPECT_GE(proxy_hits.load(), 1);
+  EXPECT_GE(target_hits.load(), 1);
+  EXPECT_FALSE(target_saw_authz.load());
+}
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+TEST(NoProxyTest, BypassedTargetReturning407DoesNotLeakProxyDigestCredentials) {
+  // Direct origin replying 407 must not trigger the digest retry; otherwise
+  // proxy creds would be sent to the (possibly hostile) origin.
+  std::atomic<int> target_hits{0};
+  std::atomic<bool> target_saw_proxy_authz{false};
+
+  no_proxy_test::ScopedServer target;
+  target.svr().Get(".*", [&](const Request &req, Response &res) {
+    target_hits++;
+    if (req.has_header("Proxy-Authorization")) {
+      target_saw_proxy_authz = true;
+    }
+    res.status = StatusCode::ProxyAuthenticationRequired_407;
+    res.set_header("Proxy-Authenticate", "Digest realm=\"evil\", qop=\"auth\", "
+                                         "nonce=\"abc\", algorithm=MD5");
+  });
+  target.listen();
+
+  // The proxy address is set to the target's port: the bypass MUST kick in;
+  // if it doesn't, the test still routes "via proxy" to the same server and
+  // the Proxy-Authorization assertion below catches the leak.
+  Client cli("evil.example", target.port());
+  cli.set_hostname_addr_map({{"evil.example", "127.0.0.1"}});
+  cli.set_proxy("127.0.0.1", target.port());
+  cli.set_proxy_digest_auth("proxy-user", "proxy-pass");
+  cli.set_no_proxy({"evil.example"});
+
+  auto res = cli.Get("/x");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::ProxyAuthenticationRequired_407, res->status);
+  EXPECT_EQ(1, target_hits.load());
+  EXPECT_FALSE(target_saw_proxy_authz.load());
+}
+#endif
+
+TEST(NoProxyTest, MultiHopRedirectThroughBypassedHostKeepsProxy) {
+  // A (via proxy) → B (NO_PROXY-matched, direct) → C must re-engage the proxy.
+  std::atomic<int> proxy_hits{0};
+  std::atomic<int> bypass_hits{0};
+  std::atomic<bool> proxy_saw_c_url{false};
+
+  no_proxy_test::ScopedServer proxy_mock, bypass_server;
+
+  proxy_mock.svr().Get(".*", [&](const Request &req, Response &res) {
+    proxy_hits++;
+    if (req.path.find("/start") != std::string::npos) {
+      res.status = 302;
+      res.set_header("Location", "http://127.0.0.1:" +
+                                     std::to_string(bypass_server.port()) +
+                                     "/middle");
+      return;
+    }
+    if (req.path.find("/end") != std::string::npos) {
+      proxy_saw_c_url = true;
+      res.set_content("c-via-proxy", "text/plain");
+      return;
+    }
+    res.set_content("unexpected", "text/plain");
+  });
+  // public.example's "advertised" port is arbitrary (the request never lands
+  // there — it goes through the proxy), but use a dynamic value to stay
+  // friendly with sharded parallel runs.
+  int public_port = bypass_server.port();
+  bypass_server.svr().Get(".*", [&](const Request &, Response &res) {
+    bypass_hits++;
+    res.status = 302;
+    res.set_header("Location", "http://public.example:" +
+                                   std::to_string(public_port) + "/end");
+  });
+  proxy_mock.listen();
+  bypass_server.listen();
+
+  Client cli("public.example", public_port);
+  cli.set_hostname_addr_map({{"public.example", "127.0.0.1"}});
+  cli.set_proxy("127.0.0.1", proxy_mock.port());
+  cli.set_no_proxy({"127.0.0.1"});
+  cli.set_follow_location(true);
+
+  auto res = cli.Get("/start");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("c-via-proxy", res->body);
+  EXPECT_GE(proxy_hits.load(), 2);
+  EXPECT_GE(bypass_hits.load(), 1);
+  EXPECT_TRUE(proxy_saw_c_url.load());
+}
+
+TEST(NoProxyTest, KeepAliveSocketInvalidatedOnSetNoProxy) {
+  // Mid-session set_no_proxy must drop any keep-alive socket so the next
+  // request reconnects to the correct endpoint.
+  std::atomic<int> proxy_hits{0};
+  std::atomic<int> target_hits{0};
+
+  no_proxy_test::ScopedServer proxy_mock, target;
+
+  proxy_mock.svr().Get(".*", [&](const Request &, Response &res) {
+    proxy_hits++;
+    res.set_content("via-proxy", "text/plain");
+  });
+  target.svr().Get(".*", [&](const Request &, Response &res) {
+    target_hits++;
+    res.set_content("direct", "text/plain");
+  });
+  proxy_mock.listen();
+  target.listen();
+
+  Client cli("public.example", target.port());
+  cli.set_hostname_addr_map({{"public.example", "127.0.0.1"}});
+  cli.set_proxy("127.0.0.1", proxy_mock.port());
+  cli.set_keep_alive(true);
+
+  auto res1 = cli.Get("/a");
+  ASSERT_TRUE(res1);
+  EXPECT_EQ("via-proxy", res1->body);
+  EXPECT_EQ(1, proxy_hits.load());
+  EXPECT_EQ(0, target_hits.load());
+
+  cli.set_no_proxy({"public.example"});
+
+  auto res2 = cli.Get("/b");
+  ASSERT_TRUE(res2);
+  EXPECT_EQ("direct", res2->body);
+  EXPECT_EQ(1, proxy_hits.load());
+  EXPECT_EQ(1, target_hits.load());
+}
+
+#if defined(CPPHTTPLIB_SSL_ENABLED) && !defined(_WIN32)
+namespace proxy_tunnel_test {
+
+// SSLServer counterpart to no_proxy_test::ScopedServer.
+class ScopedSSLServer {
+public:
+  ScopedSSLServer() : svr_(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE) {
+    port_ = svr_.bind_to_any_port("127.0.0.1");
+  }
+  ~ScopedSSLServer() {
+    svr_.stop();
+    if (th_.joinable()) { th_.join(); }
+  }
+  SSLServer &svr() { return svr_; }
+  int port() const { return port_; }
+  void listen() {
+    th_ = std::thread([this] { svr_.listen_after_bind(); });
+    svr_.wait_until_ready();
+  }
+
+private:
+  SSLServer svr_;
+  std::thread th_;
+  int port_ = 0;
+};
+
+// Accepts CONNECT, replies 200, byte-forwards to forward_port.
+class ScopedConnectProxy {
+public:
+  explicit ScopedConnectProxy(int forward_port) : forward_port_(forward_port) {
+    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd_ < 0) { return; }
+    int yes = 1;
+    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    if (::bind(listen_fd_, reinterpret_cast<sockaddr *>(&a), sizeof(a)) != 0) {
+      return;
+    }
+    socklen_t alen = sizeof(a);
+    if (::getsockname(listen_fd_, reinterpret_cast<sockaddr *>(&a), &alen) !=
+        0) {
+      return;
+    }
+    port_ = ntohs(a.sin_port);
+    if (::listen(listen_fd_, 1) != 0) { return; }
+    th_ = std::thread([this] { run(); });
+  }
+
+  ~ScopedConnectProxy() {
+    stop_ = true;
+    if (listen_fd_ >= 0) {
+      ::shutdown(listen_fd_, SHUT_RDWR);
+      ::close(listen_fd_);
+    }
+    if (th_.joinable()) { th_.join(); }
+  }
+
+  int port() const { return port_; }
+  int connect_hits() const { return connect_hits_.load(); }
+
+private:
+  void run() {
+    while (!stop_.load()) {
+      fd_set rfds;
+      FD_ZERO(&rfds);
+      FD_SET(listen_fd_, &rfds);
+      timeval tv{0, 100 * 1000};
+      int sel = ::select(listen_fd_ + 1, &rfds, nullptr, nullptr, &tv);
+      if (sel <= 0) { continue; }
+
+      int client_fd = ::accept(listen_fd_, nullptr, nullptr);
+      if (client_fd < 0) { continue; }
+
+      std::string req;
+      char buf[2048];
+      while (req.find("\r\n\r\n") == std::string::npos) {
+        ssize_t n = ::recv(client_fd, buf, sizeof(buf), 0);
+        if (n <= 0) { break; }
+        req.append(buf, static_cast<size_t>(n));
+      }
+      if (req.compare(0, 7, "CONNECT") != 0) {
+        ::close(client_fd);
+        continue;
+      }
+      connect_hits_++;
+
+      const char *ok = "HTTP/1.1 200 Connection established\r\n\r\n";
+      ::send(client_fd, ok, std::strlen(ok), 0);
+
+      int origin_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+      sockaddr_in o{};
+      o.sin_family = AF_INET;
+      o.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      o.sin_port = htons(static_cast<unsigned short>(forward_port_));
+      if (::connect(origin_fd, reinterpret_cast<sockaddr *>(&o), sizeof(o)) !=
+          0) {
+        ::close(client_fd);
+        ::close(origin_fd);
+        continue;
+      }
+
+      auto forward = [](int from, int to) {
+        char b[8192];
+        for (;;) {
+          ssize_t n = ::recv(from, b, sizeof(b), 0);
+          if (n <= 0) { break; }
+          ssize_t off = 0;
+          while (off < n) {
+            ssize_t s = ::send(to, b + off, static_cast<size_t>(n - off), 0);
+            if (s <= 0) {
+              off = n;
+              break;
+            }
+            off += s;
+          }
+        }
+        ::shutdown(to, SHUT_WR);
+      };
+
+      std::thread t1([&] { forward(client_fd, origin_fd); });
+      std::thread t2([&] { forward(origin_fd, client_fd); });
+      t1.join();
+      t2.join();
+      ::close(client_fd);
+      ::close(origin_fd);
+    }
+  }
+
+  int forward_port_ = -1;
+  int listen_fd_ = -1;
+  int port_ = 0;
+  std::thread th_;
+  std::atomic<bool> stop_{false};
+  std::atomic<int> connect_hits_{0};
+};
+
+} // namespace proxy_tunnel_test
+
+TEST(ProxyTunnelTest, OriginReturning407InsideTunnelDoesNotLeakProxyDigest) {
+  // Origin inside a CONNECT tunnel replying 407 must not trigger the digest
+  // retry; otherwise proxy creds would be sent to the origin.
+  std::atomic<int> origin_hits{0};
+  std::atomic<bool> origin_saw_proxy_authz{false};
+
+  proxy_tunnel_test::ScopedSSLServer origin;
+  origin.svr().Get(".*", [&](const Request &req, Response &res) {
+    origin_hits++;
+    if (req.has_header("Proxy-Authorization")) {
+      origin_saw_proxy_authz = true;
+    }
+    res.status = StatusCode::ProxyAuthenticationRequired_407;
+    res.set_header("Proxy-Authenticate",
+                   "Digest realm=\"evil\", qop=\"auth\", nonce=\"abc\", "
+                   "algorithm=MD5");
+  });
+  origin.listen();
+
+  proxy_tunnel_test::ScopedConnectProxy proxy(origin.port());
+  ASSERT_NE(0, proxy.port());
+
+  SSLClient cli(HOST, origin.port());
+  cli.enable_server_certificate_verification(false);
+  cli.set_proxy(HOST, proxy.port());
+  cli.set_proxy_digest_auth("proxy-user", "proxy-pass");
+
+  auto res = cli.Get("/x");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::ProxyAuthenticationRequired_407, res->status);
+  EXPECT_EQ(1, origin_hits.load());
+  EXPECT_FALSE(origin_saw_proxy_authz.load());
+  EXPECT_EQ(1, proxy.connect_hits());
+}
+#endif
