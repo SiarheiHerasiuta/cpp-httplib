@@ -51,6 +51,16 @@ inline std::string u8_to_string(const char8_t *s) {
 #define SERVER_ENCRYPTED_PRIVATE_KEY_FILE "./key_encrypted.pem"
 #define SERVER_ENCRYPTED_PRIVATE_KEY_PASS "test123!"
 
+#ifdef CPPHTTPLIB_SSL_ENABLED
+namespace httplib {
+namespace tls {
+// Declared here for the split build, where the TLS abstraction declarations
+// live below the split border; the definition is linked from httplib.cc.
+ca_store_t create_ca_store(const char *pem, size_t len);
+} // namespace tls
+} // namespace httplib
+#endif
+
 using namespace std;
 using namespace httplib;
 
@@ -374,6 +384,19 @@ TEST(DecodePathTest, UnicodeEncoding) {
   EXPECT_FALSE(decode_path_component("%uFFFF").empty());
   // %uD800 = surrogate (invalid, silently dropped)
   EXPECT_EQ("", decode_path_component("%uD800"));
+}
+
+TEST(DecodeQueryTest, RejectsNonHexEscapes) {
+  // A sign or whitespace inside the two-character escape window must not be
+  // accepted as a valid percent-encoding; the sequence is passed through
+  // literally, matching decode_uri_component / decode_path_component.
+  EXPECT_EQ("%-1", decode_query_component("%-1", false));
+  EXPECT_EQ("%-0", decode_query_component("%-0", false));
+  EXPECT_EQ("%+5", decode_query_component("%+5", false));
+  EXPECT_EQ("% 5", decode_query_component("% 5", false));
+  // Well-formed escapes still decode.
+  EXPECT_EQ("-", decode_query_component("%2D", false));
+  EXPECT_EQ("A", decode_query_component("%41", false));
 }
 
 TEST(SanitizeFilenameTest, VariousPatterns) {
@@ -808,6 +831,41 @@ TEST(ParseAcceptHeaderTest, ContentTypesPopulatedAndInvalidHeaderHandling) {
     ASSERT_TRUE(res);
     EXPECT_EQ(StatusCode::BadRequest_400, res->status);
   }
+}
+
+TEST(ServerStartHandlerTest, CalledOnceWhenReady) {
+  Server svr;
+  svr.Get("/", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  std::atomic<int> start_count{0};
+  std::atomic<bool> running_when_called{false};
+  svr.set_start_handler([&]() {
+    running_when_called = svr.is_running();
+    start_count++;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  // A successful request proves the accept loop is running, which the start
+  // handler precedes; so by now the handler must have run exactly once.
+  Client cli(HOST, port);
+  cli.set_connection_timeout(std::chrono::seconds(5));
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+
+  EXPECT_EQ(1, start_count.load());
+  EXPECT_TRUE(running_when_called.load());
 }
 
 TEST(DivideTest, DivideStringTests) {
@@ -3254,6 +3312,64 @@ TEST(RequestHandlerTest, PreRequestHandler) {
   }
 }
 
+// The pre-request handler must run before the request body is read, so a
+// rejected request never forces the server to buffer a (potentially large)
+// body. Here the posted body is larger than the payload limit: if the body
+// were read first the server would answer 413, but because the pre-request
+// handler runs first it answers 403 and the body is never read.
+TEST(RequestHandlerTest, PreRequestHandlerRunsBeforeBodyIsRead) {
+  Server svr;
+
+  svr.set_payload_max_length(8);
+
+  auto handler_ran = false;
+  svr.Post("/reject", [&](const Request &req, Response &res) {
+    handler_ran = true;
+    res.set_content(req.body, "text/plain");
+  });
+
+  svr.Post("/accept", [](const Request &req, Response &res) {
+    res.set_content(req.body, "text/plain");
+  });
+
+  svr.set_pre_request_handler([](const Request &req, Response &res) {
+    if (req.matched_route == "/reject") {
+      res.status = StatusCode::Forbidden_403;
+      res.set_content("denied", "text/plain");
+      return Server::HandlerResponse::Handled;
+    }
+    return Server::HandlerResponse::Unhandled;
+  });
+
+  auto thread = std::thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, PORT);
+
+  // Body (10 bytes) exceeds the 8-byte limit, yet the pre-request handler
+  // rejects with 403 before the body is read, so 413 is never reached.
+  {
+    auto res = cli.Post("/reject", "0123456789", "text/plain");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(StatusCode::Forbidden_403, res->status);
+    EXPECT_EQ("denied", res->body);
+    EXPECT_FALSE(handler_ran);
+  }
+
+  // An approved route still reads the body and enforces the payload limit.
+  {
+    auto res = cli.Post("/accept", "0123456789", "text/plain");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(StatusCode::PayloadTooLarge_413, res->status);
+  }
+}
+
 TEST(UserDataTest, BasicOperations) {
   httplib::UserData ud;
 
@@ -3716,6 +3832,23 @@ protected:
                    [](size_t offset, size_t /*length*/, DataSink &sink) {
                      sink.os << (offset < 3 ? "a" : "b");
                      return true;
+                   });
+             })
+        .Get("/streamed-without-length",
+             [&](const Request & /*req*/, Response &res) {
+               auto data = new std::string("abcdefg");
+               res.set_content_provider(
+                   "text/plain",
+                   [data](size_t offset, DataSink &sink) {
+                     if (offset < data->size()) {
+                       sink.os << data->substr(offset);
+                     }
+                     sink.done();
+                     return true;
+                   },
+                   [data](bool success) {
+                     EXPECT_TRUE(success);
+                     delete data;
                    });
              })
         .Get("/streamed-with-range",
@@ -5195,6 +5328,16 @@ TEST_F(ServerTest, GetStreamed) {
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("6", res->get_header_value("Content-Length"));
   EXPECT_EQ(std::string("aaabbb"), res->body);
+}
+
+TEST_F(ServerTest, GetStreamedWithoutLengthWithRange) {
+  auto res =
+      cli_.Get("/streamed-without-length", {make_range_header({{0, -1}})});
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ(false, res->has_header("Content-Length"));
+  EXPECT_EQ(false, res->has_header("Content-Range"));
+  EXPECT_EQ(std::string("abcdefg"), res->body);
 }
 
 TEST_F(ServerTest, GetStreamedWithRange1) {
@@ -11505,6 +11648,241 @@ TEST(SSLClientTest, SetCaCertStoreSkipsSystemCerts_Online) {
   EXPECT_EQ(Error::SSLServerVerification, res.error());
 }
 
+// Same as above, but through the native store handle path. Regression test:
+// set_ca_cert_store() used to leave no trace on the client, so load_certs()
+// merged system certs into the user-provided store.
+TEST(SSLClientTest, SetCaCertStoreNativeSkipsSystemCerts_Online) {
+  std::string cert;
+  read_file(SERVER_CERT2_FILE, cert);
+
+  SSLClient cli("google.com");
+  cli.set_ca_cert_store(tls::create_ca_store(cert.c_str(), cert.size()));
+  cli.enable_server_certificate_verification(true);
+
+  auto res = cli.Get("/");
+  ASSERT_FALSE(res);
+  EXPECT_EQ(Error::SSLServerVerification, res.error());
+}
+
+// A custom store set via the native handle must still verify a server whose
+// cert it does contain.
+TEST(SSLClientTest, SetCaCertStoreNativeVerifiesLocalServer) {
+  SSLServer svr(SERVER_CERT2_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.Get("/test", [&](const Request &, Response &res) {
+    res.set_content("test", "text/plain");
+  });
+
+  thread t = thread([&]() { ASSERT_TRUE(svr.listen("127.0.0.1", PORT)); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  SSLClient cli("127.0.0.1", PORT);
+  std::string cert;
+  read_file(SERVER_CERT2_FILE, cert);
+  cli.set_ca_cert_store(tls::create_ca_store(cert.c_str(), cert.size()));
+  cli.enable_server_certificate_verification(true);
+  cli.set_connection_timeout(30);
+
+  auto res = cli.Get("/test");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(StatusCode::OK_200, res->status);
+}
+
+// CA certs loaded through the universal Client must be transferred to the
+// client created internally for following an HTTPS redirect. Regression test:
+// Client::load_ca_cert_store() used to bypass the PEM-based path that stores
+// the CA data for redirect transfer.
+TEST(UniversalClientRedirectTest, LoadCaCertStore) {
+  auto ssl_port = PORT + 1;
+
+  SSLServer ssl_svr1(SERVER_CERT2_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(ssl_svr1.is_valid());
+  ssl_svr1.Get("/index", [&](const Request &, Response &res) {
+    res.set_redirect("https://127.0.0.1:" + std::to_string(ssl_port) +
+                     "/index");
+  });
+
+  SSLServer ssl_svr2(SERVER_CERT2_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(ssl_svr2.is_valid());
+  ssl_svr2.Get("/index", [&](const Request &, Response &res) {
+    res.set_content("test", "text/plain");
+  });
+
+  thread t = thread([&]() { ASSERT_TRUE(ssl_svr1.listen("127.0.0.1", PORT)); });
+  thread t2 =
+      thread([&]() { ASSERT_TRUE(ssl_svr2.listen("127.0.0.1", ssl_port)); });
+  auto se = detail::scope_exit([&] {
+    ssl_svr2.stop();
+    ssl_svr1.stop();
+    t2.join();
+    t.join();
+    ASSERT_FALSE(ssl_svr1.is_running());
+  });
+
+  ssl_svr1.wait_until_ready();
+  ssl_svr2.wait_until_ready();
+
+  Client cli("https://127.0.0.1:" + std::to_string(PORT));
+  std::string cert;
+  read_file(SERVER_CERT2_FILE, cert);
+  cli.load_ca_cert_store(cert.c_str(), cert.size());
+  cli.enable_server_certificate_verification(true);
+  cli.set_follow_location(true);
+  cli.set_connection_timeout(30);
+
+  auto res = cli.Get("/index");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(StatusCode::OK_200, res->status);
+}
+
+// enable_system_ca(true) loads system CA certs in addition to a custom CA,
+// so a host signed by a system CA verifies even though a custom CA is set
+TEST(SSLClientTest, EnableSystemCaWithCustomCa_Online) {
+  std::string cert;
+  read_file(SERVER_CERT2_FILE, cert);
+
+  SSLClient cli("google.com");
+  cli.load_ca_cert_store(cert.c_str(), cert.size());
+  cli.enable_system_ca(true);
+  cli.enable_server_certificate_verification(true);
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(StatusCode::MovedPermanently_301, res->status);
+}
+
+// The custom CA remains effective when combined with the system CA
+TEST(SSLClientTest, EnableSystemCaCustomCaVerifiesLocalServer) {
+  SSLServer svr(SERVER_CERT2_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.Get("/test", [&](const Request &, Response &res) {
+    res.set_content("test", "text/plain");
+  });
+
+  thread t = thread([&]() { ASSERT_TRUE(svr.listen("127.0.0.1", PORT)); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  SSLClient cli("127.0.0.1", PORT);
+  std::string cert;
+  read_file(SERVER_CERT2_FILE, cert);
+  cli.load_ca_cert_store(cert.c_str(), cert.size());
+  cli.enable_system_ca(true);
+  cli.enable_server_certificate_verification(true);
+  cli.set_connection_timeout(30);
+
+  auto res = cli.Get("/test");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(StatusCode::OK_200, res->status);
+}
+
+// Regression test: for IP hosts the Mbed TLS and wolfSSL backends used to
+// skip chain verification entirely (only the certificate identity was
+// checked), so a server presenting an untrusted certificate with a matching
+// IP SAN was accepted. The chain must be validated for IP hosts too.
+TEST(SSLClientTest, IpHostUntrustedChainFails) {
+  SSLServer svr(SERVER_CERT2_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.Get("/test", [&](const Request &, Response &res) {
+    res.set_content("test", "text/plain");
+  });
+
+  thread t = thread([&]() { ASSERT_TRUE(svr.listen("127.0.0.1", PORT)); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  SSLClient cli("127.0.0.1", PORT);
+  std::string cert;
+  // A trusted CA that did not sign the server certificate. The server cert
+  // (cert2) carries the matching IP SAN, so only chain validation can reject
+  // this connection.
+  read_file(CLIENT_CA_CERT_FILE, cert);
+  cli.load_ca_cert_store(cert.c_str(), cert.size());
+  cli.enable_server_certificate_verification(true);
+  cli.set_connection_timeout(30);
+
+  auto res = cli.Get("/test");
+  ASSERT_FALSE(res);
+}
+
+// enable_system_ca(false) prevents system CA loading entirely
+TEST(SSLClientTest, DisableSystemCa_Online) {
+  SSLClient cli("google.com");
+  cli.enable_system_ca(false);
+  cli.enable_server_certificate_verification(true);
+
+  auto res = cli.Get("/");
+  ASSERT_FALSE(res);
+  // OpenSSL reports a verification failure; Mbed TLS fails the handshake
+  // itself when the CA chain is empty
+  EXPECT_TRUE(res.error() == Error::SSLServerVerification ||
+              res.error() == Error::SSLConnection);
+}
+
+// The universal Client forwards enable_system_ca()
+TEST(UniversalClientTest, EnableSystemCaWithCustomCa_Online) {
+  std::string cert;
+  read_file(SERVER_CERT2_FILE, cert);
+
+  Client cli("https://google.com");
+  cli.load_ca_cert_store(cert.c_str(), cert.size());
+  cli.enable_system_ca(true);
+  cli.enable_server_certificate_verification(true);
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(StatusCode::MovedPermanently_301, res->status);
+}
+
+// The system CA policy must carry over to the client created internally for
+// following a cross-host HTTPS redirect
+TEST(UniversalClientRedirectTest, EnableSystemCaCarriesOver_Online) {
+  SSLServer svr(SERVER_CERT2_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.Get("/index", [&](const Request &, Response &res) {
+    res.set_redirect("https://www.google.com/");
+  });
+
+  thread t = thread([&]() { ASSERT_TRUE(svr.listen("127.0.0.1", PORT)); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli("https://127.0.0.1:" + std::to_string(PORT));
+  std::string cert;
+  read_file(SERVER_CERT2_FILE, cert);
+  cli.load_ca_cert_store(cert.c_str(), cert.size());
+  cli.enable_system_ca(true);
+  cli.enable_server_certificate_verification(true);
+  cli.set_follow_location(true);
+  cli.set_connection_timeout(30);
+
+  // Receiving any response proves the redirect client completed the TLS
+  // handshake with a system-CA-signed host
+  auto res = cli.Get("/index");
+  ASSERT_TRUE(res);
+}
+
 TEST(MultipartFormDataTest, LargeData) {
   SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
 
@@ -17644,6 +18022,57 @@ TEST(WebSocketTest, ComplexPath) {
   EXPECT_TRUE(ws2.is_valid());
 }
 
+TEST(WebSocketTest, SpecifyServerIPAddress_AnotherHostname) {
+  Server svr;
+  svr.WebSocket("/ws", [](const Request &, ws::WebSocket &ws) {
+    std::string msg;
+    while (ws.read(msg)) {}
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  svr.wait_until_ready();
+
+  auto another_host = "example.com";
+  auto wrong_ip = "192.0.2.1";
+
+  ws::WebSocketClient client("ws://localhost:" + std::to_string(port) + "/ws");
+  client.set_hostname_addr_map({{another_host, wrong_ip}});
+
+  ASSERT_TRUE(client.connect());
+  EXPECT_TRUE(client.is_open());
+  client.close();
+
+  svr.stop();
+  t.join();
+}
+
+TEST(WebSocketTest, SpecifyServerIPAddress_RealHostname) {
+  Server svr;
+  svr.WebSocket("/ws", [](const Request &, ws::WebSocket &ws) {
+    std::string msg;
+    while (ws.read(msg)) {}
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  svr.wait_until_ready();
+
+  auto wrong_ip = "192.0.2.1";
+
+  ws::WebSocketClient client("ws://localhost:" + std::to_string(port) + "/ws");
+  client.set_hostname_addr_map({{"localhost", wrong_ip}});
+  client.set_connection_timeout(1);
+  client.set_read_timeout(1);
+  client.set_write_timeout(1);
+
+  EXPECT_FALSE(client.connect());
+  EXPECT_FALSE(client.is_open());
+
+  svr.stop();
+  t.join();
+}
+
 class WebSocketIntegrationTest : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -18078,6 +18507,51 @@ TEST(WebSocketPreRoutingTest, RejectWithoutAuth) {
   t.join();
 }
 
+TEST(WebSocketTest, QueryStringInHandshake) {
+  Server svr;
+
+  std::mutex mtx;
+  std::string received_target;
+  std::string received_token;
+
+  svr.WebSocket("/ws", [&](const Request &req, ws::WebSocket &ws) {
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      received_target = req.target;
+      if (req.has_param("token")) {
+        received_token = req.get_param_value("token");
+      }
+    }
+    std::string msg;
+    while (ws.read(msg)) {
+      ws.send(msg);
+    }
+  });
+
+  auto port = svr.bind_to_any_port("localhost");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  svr.wait_until_ready();
+
+  ws::WebSocketClient client("ws://localhost:" + std::to_string(port) +
+                             "/ws?token=ABC&session=123");
+  ASSERT_TRUE(client.connect());
+  // Round-trip ensures the handler has run and captured the request.
+  ASSERT_TRUE(client.send("hello"));
+  std::string msg;
+  ASSERT_TRUE(client.read(msg));
+  EXPECT_EQ("hello", msg);
+  client.close();
+
+  {
+    std::lock_guard<std::mutex> lock(mtx);
+    EXPECT_EQ("/ws?token=ABC&session=123", received_target);
+    EXPECT_EQ("ABC", received_token);
+  }
+
+  svr.stop();
+  t.join();
+}
+
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 class WebSocketSSLIntegrationTest : public ::testing::Test {
 protected:
@@ -18123,6 +18597,116 @@ TEST_F(WebSocketSSLIntegrationTest, TextEcho) {
   EXPECT_EQ("Hello WSS", msg);
 
   client.close();
+}
+#endif
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+class WebSocketSSLCATest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    server_ = httplib::detail::make_unique<SSLServer>(SERVER_CERT2_FILE,
+                                                      SERVER_PRIVATE_KEY_FILE);
+    server_->WebSocket("/echo", [](const Request &, ws::WebSocket &ws) {
+      std::string msg;
+      while (ws.read(msg)) {
+        ws.send(msg);
+      }
+    });
+    port_ = server_->bind_to_any_port("127.0.0.1");
+    server_thread_ = std::thread([this]() { server_->listen_after_bind(); });
+    server_->wait_until_ready();
+  }
+
+  void TearDown() override {
+    server_->stop();
+    if (server_thread_.joinable()) { server_thread_.join(); }
+  }
+
+  std::string url() const {
+    return "wss://127.0.0.1:" + std::to_string(port_) + "/echo";
+  }
+
+  std::unique_ptr<SSLServer> server_;
+  std::thread server_thread_;
+  int port_ = 0;
+};
+
+// A custom CA loaded as PEM verifies the server with full certificate
+// verification enabled
+TEST_F(WebSocketSSLCATest, LoadCaCertStoreVerifiesServer) {
+  ws::WebSocketClient client(url());
+  std::string cert;
+  read_file(SERVER_CERT2_FILE, cert);
+  client.load_ca_cert_store(cert.c_str(), cert.size());
+
+  ASSERT_TRUE(client.connect());
+  ASSERT_TRUE(client.send("hello"));
+  std::string msg;
+  EXPECT_EQ(ws::Text, client.read(msg));
+  EXPECT_EQ("hello", msg);
+  client.close();
+}
+
+// A custom CA that does not cover the server must fail verification (the
+// custom CA is exclusive; system certs are not loaded alongside it)
+TEST_F(WebSocketSSLCATest, WrongCustomCaFailsVerification) {
+  ws::WebSocketClient client(url());
+  std::string cert;
+  read_file(CLIENT_CA_CERT_FILE, cert);
+  client.load_ca_cert_store(cert.c_str(), cert.size());
+
+  ASSERT_FALSE(client.connect());
+}
+
+// Regression test: reconnecting with a native custom CA store used to reuse
+// a store handle the previous TLS context had already freed (use-after-free
+// under the OpenSSL backend). The context now lives as long as the client.
+TEST_F(WebSocketSSLCATest, ReconnectWithCustomCaStore) {
+  ws::WebSocketClient client(url());
+  std::string cert;
+  read_file(SERVER_CERT2_FILE, cert);
+  client.set_ca_cert_store(tls::create_ca_store(cert.c_str(), cert.size()));
+
+  ASSERT_TRUE(client.connect());
+  client.close();
+
+  ASSERT_TRUE(client.connect());
+  ASSERT_TRUE(client.send("again"));
+  std::string msg;
+  EXPECT_EQ(ws::Text, client.read(msg));
+  EXPECT_EQ("again", msg);
+  client.close();
+}
+
+// Regression test: a certificate with a trusted chain but no identity match
+// for the server IP must be rejected. The Mbed TLS backend used to skip
+// verification entirely for IP hosts, so this connection succeeded there.
+// SERVER_CERT_FILE has no IP SAN (CN only), so trusting it as a CA satisfies
+// chain verification while the identity check must still fail.
+TEST(WebSocketSSLVerifyTest, TrustedChainWrongIdentityFails) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.WebSocket("/echo", [](const Request &, ws::WebSocket &ws) {
+    std::string msg;
+    while (ws.read(msg)) {
+      ws.send(msg);
+    }
+  });
+  auto port = svr.bind_to_any_port("127.0.0.1");
+  auto t = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  ws::WebSocketClient client("wss://127.0.0.1:" + std::to_string(port) +
+                             "/echo");
+  std::string cert;
+  read_file(SERVER_CERT_FILE, cert);
+  client.load_ca_cert_store(cert.c_str(), cert.size());
+
+  ASSERT_FALSE(client.connect());
 }
 #endif
 
