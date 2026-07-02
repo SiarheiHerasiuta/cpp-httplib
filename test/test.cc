@@ -420,6 +420,32 @@ TEST(SanitizeFilenameTest, VariousPatterns) {
   EXPECT_EQ("", httplib::sanitize_filename("   "));
 }
 
+// Forward declaration: in split builds split.py strips `inline` and moves the
+// definition into httplib.cc, so detail::base64_encode is not visible from the
+// public httplib.h. Re-declaring it here lets the tests link against the symbol
+// in both header-only and split builds.
+namespace httplib {
+namespace detail {
+std::string base64_encode(const std::string &in);
+} // namespace detail
+} // namespace httplib
+
+TEST(Base64EncodeTest, KnownAnswers) {
+  // RFC 4648 test vectors. Inputs of four bytes or more exercise the round
+  // where the accumulator's top bit is already set before the next shift.
+  EXPECT_EQ("", detail::base64_encode(""));
+  EXPECT_EQ("Zg==", detail::base64_encode("f"));
+  EXPECT_EQ("Zm8=", detail::base64_encode("fo"));
+  EXPECT_EQ("Zm9v", detail::base64_encode("foo"));
+  EXPECT_EQ("Zm9vYg==", detail::base64_encode("foob"));
+  EXPECT_EQ("Zm9vYmE=", detail::base64_encode("fooba"));
+  EXPECT_EQ("Zm9vYmFy", detail::base64_encode("foobar"));
+
+  // High bytes keep the top bit set across several rounds.
+  EXPECT_EQ("AAECA//+wIB/", detail::base64_encode(std::string(
+                                "\x00\x01\x02\x03\xff\xfe\xc0\x80\x7f", 9)));
+}
+
 TEST(EncodeQueryParamTest, ParseUnescapedChararactersTest) {
   string unescapedCharacters = "-_.!~*'()";
 
@@ -638,6 +664,31 @@ TEST(TrimTests, TrimStringTests) {
   EXPECT_EQ("abc", detail::trim_copy("abc"));
   EXPECT_EQ("abc", detail::trim_copy("  abc  "));
   EXPECT_TRUE(detail::trim_copy("").empty());
+}
+
+TEST(AsciiTest, LocaleIndependentClassification) {
+  // detail::is_ascii_digit/alpha/alnum replace the <cctype> classifiers,
+  // which consult the global C locale: std::isalnum(0xC5) can return true
+  // once an embedder calls setlocale() (observed on macOS). The is_ascii_*
+  // helpers must classify every byte by the ASCII grammar alone.
+  for (int i = 0; i < 256; i++) {
+    auto c = static_cast<char>(i);
+    auto is_digit = i >= '0' && i <= '9';
+    auto is_upper = i >= 'A' && i <= 'Z';
+    auto is_lower = i >= 'a' && i <= 'z';
+
+    EXPECT_EQ(is_digit, detail::is_ascii_digit(c)) << "byte " << i;
+    EXPECT_EQ(is_upper || is_lower, detail::is_ascii_alpha(c)) << "byte " << i;
+    EXPECT_EQ(is_digit || is_upper || is_lower, detail::is_ascii_alnum(c))
+        << "byte " << i;
+  }
+
+  // Regression check for the reported byte: 0xC5 is not alphanumeric.
+  EXPECT_FALSE(detail::is_ascii_alnum(static_cast<char>(0xC5)));
+
+  // Non-ASCII bytes must be percent-encoded, never passed through as
+  // alphanumeric.
+  EXPECT_EQ("%C5", httplib::encode_uri_component("\xC5"));
 }
 
 TEST(FromCharsTest, Double) {
@@ -2900,6 +2951,40 @@ TEST(PathUrlEncodeTest, PathUrlEncode) {
     // url-encoded, and server-side the params get decoded turning `+`
     // into spaces.
     EXPECT_EQ("explicitly encoded", res->body);
+  }
+}
+
+TEST(PathUrlEncodeTest, PreEncodedQueryNotReencoded) {
+  // When path encoding is disabled the client must transmit the supplied
+  // query verbatim. Decoding-then-re-encoding it (the previous behavior)
+  // corrupts pre-encoded binary payloads: e.g. `%20` would be turned into
+  // `+`, which a strict RFC 3986 server decodes back as `+` (0x2B) rather
+  // than a space (0x20). Assert on the raw wire target to catch this.
+  Server svr;
+
+  const std::string expected_target = "/foo?q=a%20b%2Cc%24d%3Bx&a=%00%FF";
+
+  svr.Get("/foo", [&](const Request &req, Response &res) {
+    EXPECT_EQ(expected_target, req.target);
+    res.status = StatusCode::OK_200;
+  });
+
+  auto thread = std::thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, PORT);
+    cli.set_path_encode(false);
+
+    auto res = cli.Get(expected_target.c_str());
+    ASSERT_TRUE(res);
+    EXPECT_EQ(StatusCode::OK_200, res->status);
   }
 }
 
@@ -5668,7 +5753,7 @@ TEST_F(ServerTest, GetWithRange1) {
                                          make_range_header({{3, 5}}),
                                          {"Accept-Encoding", ""},
                                      });
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("3", res->get_header_value("Content-Length"));
   EXPECT_EQ(true, res->has_header("Content-Range"));
@@ -5681,7 +5766,7 @@ TEST_F(ServerTest, GetWithRange2) {
                                          make_range_header({{1, -1}}),
                                          {"Accept-Encoding", ""},
                                      });
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("6", res->get_header_value("Content-Length"));
   EXPECT_EQ(true, res->has_header("Content-Range"));
@@ -5694,7 +5779,7 @@ TEST_F(ServerTest, GetWithRange3) {
                                          make_range_header({{0, 0}}),
                                          {"Accept-Encoding", ""},
                                      });
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("1", res->get_header_value("Content-Length"));
   EXPECT_EQ(true, res->has_header("Content-Range"));
@@ -5707,7 +5792,7 @@ TEST_F(ServerTest, GetWithRange4) {
                                          make_range_header({{-1, 2}}),
                                          {"Accept-Encoding", ""},
                                      });
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("2", res->get_header_value("Content-Length"));
   EXPECT_EQ(true, res->has_header("Content-Range"));
@@ -5720,7 +5805,7 @@ TEST_F(ServerTest, GetWithRange5) {
                                          make_range_header({{0, 5}}),
                                          {"Accept-Encoding", ""},
                                      });
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("6", res->get_header_value("Content-Length"));
   EXPECT_EQ(true, res->has_header("Content-Range"));
@@ -6469,6 +6554,161 @@ TEST_F(ServerTest, PostMultipartPlusBoundary) {
 
   ASSERT_TRUE(res);
   EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+
+TEST(MultipartFormDataTest, FieldEscaping) {
+  Server svr;
+
+  svr.Post("/post", [&](const Request &req, Response & /*res*/,
+                        const ContentReader &content_reader) {
+    ASSERT_TRUE(req.is_multipart_form_data());
+    std::vector<FormData> received;
+    content_reader(
+        [&](const FormData &file) {
+          received.push_back(file);
+          return true;
+        },
+        [&](const char *data, size_t data_length) {
+          received.back().content.append(data, data_length);
+          return true;
+        });
+
+    // '"', CR and LF in names and filenames are escaped following the
+    // WHATWG HTML standard, so each part still parses as a single part
+    // with no injected headers. Content types get CR/LF escaped too,
+    // while '"' (legal there, e.g. quoted charset) is preserved.
+    ASSERT_EQ(4U, received.size());
+
+    EXPECT_EQ("na%22me", received[0].name);
+    EXPECT_EQ("quoted name", received[0].content);
+
+    EXPECT_EQ("file", received[1].name);
+    EXPECT_EQ("evil%0D%0AContent-Type: text/evil%0D%0A%0D%0A.pdf",
+              received[1].filename);
+    EXPECT_EQ("application/octet-stream", received[1].content_type);
+    EXPECT_EQ("injected", received[1].content);
+
+    EXPECT_EQ("my%0Dna%0Ame", received[2].name);
+    EXPECT_EQ("my%22file.txt", received[2].filename);
+    EXPECT_EQ("cr lf name", received[2].content);
+
+    EXPECT_EQ("typed", received[3].name);
+    EXPECT_EQ("text/plain; charset=\"utf-8\"%0D%0AX-Evil: 1",
+              received[3].content_type);
+    EXPECT_EQ("typed content", received[3].content);
+  });
+
+  auto port = svr.bind_to_any_port("localhost");
+  auto t = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli("localhost", port);
+
+  UploadFormDataItems items = {
+      {"na\"me", "quoted name", "", ""},
+      {"file", "injected", "evil\r\nContent-Type: text/evil\r\n\r\n.pdf",
+       "application/octet-stream"},
+      {"my\rna\nme", "cr lf name", "my\"file.txt", "text/plain"},
+      {"typed", "typed content", "",
+       "text/plain; charset=\"utf-8\"\r\nX-Evil: 1"},
+  };
+
+  auto res = cli.Post("/post", items);
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+
+TEST(MultipartFormDataTest, PublicWriterAPI) {
+  const UploadFormDataItems items = {
+      {"name1", "Content 1", "", ""},
+      {"name2", "Content 2", "file2.txt", "text/plain"},
+  };
+
+  Server svr;
+
+  svr.Post("/post", [&](const Request &req, Response & /*res*/,
+                        const ContentReader &content_reader) {
+    ASSERT_TRUE(req.is_multipart_form_data());
+    std::vector<FormData> received;
+    content_reader(
+        [&](const FormData &file) {
+          received.push_back(file);
+          return true;
+        },
+        [&](const char *data, size_t data_length) {
+          received.back().content.append(data, data_length);
+          return true;
+        });
+
+    ASSERT_EQ(2U, received.size());
+    EXPECT_EQ("name1", received[0].name);
+    EXPECT_EQ("Content 1", received[0].content);
+    EXPECT_EQ("name2", received[1].name);
+    EXPECT_EQ("Content 2", received[1].content);
+    EXPECT_EQ("file2.txt", received[1].filename);
+    EXPECT_EQ("text/plain", received[1].content_type);
+  });
+
+  auto port = svr.bind_to_any_port("localhost");
+  auto t = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli("localhost", port);
+
+  // Whole-body serialization with a generated boundary
+  {
+    MultipartFormDataWriter writer;
+    EXPECT_TRUE(is_valid_multipart_boundary(writer.boundary()));
+    EXPECT_EQ("multipart/form-data; boundary=" + writer.boundary(),
+              writer.content_type());
+
+    auto body = writer.serialize(items);
+    EXPECT_EQ(body.size(), writer.content_length(items));
+
+    auto res = cli.Post("/post", body, writer.content_type());
+    ASSERT_TRUE(res);
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+  }
+
+  // Per-part framing with a custom boundary via a content provider
+  {
+    EXPECT_FALSE(is_valid_multipart_boundary("bad boundary"));
+    ASSERT_TRUE(is_valid_multipart_boundary("custom-boundary_123"));
+
+    MultipartFormDataWriter writer("custom-boundary_123");
+    EXPECT_EQ("custom-boundary_123", writer.boundary());
+
+    std::string body;
+    for (const auto &item : items) {
+      body += writer.item_begin(item);
+      body += item.content;
+      body += MultipartFormDataWriter::item_end();
+    }
+    body += writer.finish();
+    EXPECT_EQ(body.size(), writer.content_length(items));
+
+    auto res = cli.Post(
+        "/post", body.size(),
+        [&](size_t offset, size_t length, DataSink &sink) {
+          sink.write(body.data() + offset, length);
+          return true;
+        },
+        writer.content_type());
+    ASSERT_TRUE(res);
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+  }
 }
 
 TEST_F(ServerTest, PostContentReceiverGzip) {
@@ -13261,6 +13501,44 @@ TEST(TaskQueueTest, IncreaseAtomicIntegerWithQueueLimit) {
   EXPECT_TRUE(queued_count >= qlimit);
 }
 
+TEST(TaskQueueTest, IdleTimeoutAtRuntime) {
+  // Use a short idle timeout so a dynamic thread spawns, times out and
+  // exits during the test, and the pool keeps working afterwards.
+  std::unique_ptr<TaskQueue> task_queue{new ThreadPool{
+      /*num_threads=*/1, /*max_threads=*/2, /*max_queued_requests=*/0,
+      /*idle_timeout_sec=*/1}};
+
+  std::atomic_uint count{0};
+  std::condition_variable cv;
+  std::mutex mtx;
+  bool release = false;
+
+  // Block the base thread so the second task spawns a dynamic thread.
+  EXPECT_TRUE(task_queue->enqueue([&] {
+    std::unique_lock<std::mutex> lock(mtx);
+    while (!release) {
+      cv.wait(lock);
+    }
+    count++;
+  }));
+  EXPECT_TRUE(task_queue->enqueue([&] { count++; }));
+
+  // Let the dynamic thread finish its task and exceed the idle timeout.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+  {
+    std::unique_lock<std::mutex> lock(mtx);
+    release = true;
+  }
+  cv.notify_all();
+
+  // The pool must still accept and run tasks after the dynamic thread exited.
+  EXPECT_TRUE(task_queue->enqueue([&] { count++; }));
+
+  task_queue->shutdown();
+  EXPECT_EQ(3u, count.load());
+}
+
 TEST(TaskQueueTest, MaxQueuedRequests) {
   static constexpr unsigned int qlimit{3};
   std::unique_ptr<TaskQueue> task_queue{new ThreadPool{1, 1, qlimit}};
@@ -18754,6 +19032,47 @@ TEST(WebSocketTest, QueryStringInHandshake) {
     std::lock_guard<std::mutex> lock(mtx);
     EXPECT_EQ("/ws?token=ABC&session=123", received_target);
     EXPECT_EQ("ABC", received_token);
+  }
+
+  svr.stop();
+  t.join();
+}
+
+TEST(WebSocketTest, HostHeaderInHandshake) {
+  Server svr;
+
+  std::mutex mtx;
+  std::string received_host;
+
+  svr.WebSocket("/ws", [&](const Request &req, ws::WebSocket &ws) {
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      received_host = req.get_header_value("Host");
+    }
+    std::string msg;
+    while (ws.read(msg)) {
+      ws.send(msg);
+    }
+  });
+
+  auto port = svr.bind_to_any_port("localhost");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  svr.wait_until_ready();
+
+  ws::WebSocketClient client("ws://localhost:" + std::to_string(port) + "/ws");
+  ASSERT_TRUE(client.connect());
+  // Round-trip ensures the handler has run and captured the request.
+  ASSERT_TRUE(client.send("hello"));
+  std::string msg;
+  ASSERT_TRUE(client.read(msg));
+  client.close();
+
+  {
+    std::lock_guard<std::mutex> lock(mtx);
+    // Non-default port must be present in the Host header. Default ports
+    // (80/443) are omitted; that logic is covered by
+    // MakeHostAndPortStringTest.
+    EXPECT_EQ("localhost:" + std::to_string(port), received_host);
   }
 
   svr.stop();
