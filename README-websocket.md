@@ -135,11 +135,31 @@ bool is_open() const;
 explicit WebSocketClient(const std::string &scheme_host_port_path,
                          const Headers &headers = {});
 
+// Constructor with a client certificate for mutual TLS (wss:// only,
+// requires CPPHTTPLIB_OPENSSL_SUPPORT). The certificate is ignored for
+// ws:// URLs.
+struct PemMemory {
+  const char *cert_pem;
+  size_t cert_pem_len;
+  const char *key_pem;
+  size_t key_pem_len;
+  const char *private_key_password;
+};
+explicit WebSocketClient(const std::string &scheme_host_port_path,
+                         const PemMemory &pem, const Headers &headers = {});
+
 // Check if the URL was parsed successfully
 bool is_valid() const;
 
-// Connect (performs HTTP upgrade handshake)
-bool connect();
+// Connect (performs HTTP upgrade handshake). The returned Result is truthy
+// only when the handshake fully succeeded; on failure it describes what went
+// wrong:
+//   res.error()             httplib::Error identifying the failing layer
+//   res.status()            HTTP status of the upgrade response (-1 if none)
+//   res.headers()           headers of the upgrade response
+//   res.ssl_error()         TLS error detail (wss://, SSL builds only)
+//   res.ssl_backend_error() backend-specific TLS error code (SSL builds only)
+Result connect();
 
 // Get the subprotocol selected by the server (empty if none)
 const std::string &subprotocol() const;
@@ -155,11 +175,20 @@ bool is_open() const;
 // Timeouts
 void set_read_timeout(time_t sec, time_t usec = 0);
 void set_write_timeout(time_t sec, time_t usec = 0);
+void set_connection_timeout(time_t sec, time_t usec = 0);
+template <class Rep, class Period>
+void set_read_timeout(const std::chrono::duration<Rep, Period> &duration);
+template <class Rep, class Period>
+void set_write_timeout(const std::chrono::duration<Rep, Period> &duration);
+template <class Rep, class Period>
+void set_connection_timeout(const std::chrono::duration<Rep, Period> &duration);
 
 // SSL configuration (wss:// only, requires CPPHTTPLIB_OPENSSL_SUPPORT)
-void set_ca_cert_path(const std::string &path);
+void set_ca_cert_path(const std::string &ca_cert_file_path,
+                      const std::string &ca_cert_dir_path = std::string());
 void set_ca_cert_store(tls::ca_store_t store);
 void enable_server_certificate_verification(bool enabled);
+void enable_server_hostname_verification(bool enabled);
 ```
 
 ## Examples
@@ -197,6 +226,26 @@ if (ws.connect()) {
         std::cout << msg << std::endl; // "echo: hello", "echo: world"
     }
     // read() returns false when the server closes the connection
+}
+```
+
+### Inspecting Connection Failures
+
+`connect()` returns a `Result` that tells you why a connection attempt failed.
+`error()` distinguishes network problems (`Connection`, `ConnectionTimeout`),
+TLS problems (`SSLConnection`, `SSLServerVerification`,
+`SSLServerHostnameVerification`), and upgrade rejections
+(`WebSocketHandshake`). When the server answered with something other than
+`101 Switching Protocols`, `status()` and `headers()` carry that response:
+
+```cpp
+auto res = ws.connect();
+if (!res) {
+    std::cerr << "connect failed: " << httplib::to_string(res.error()) << std::endl;
+    if (res.status() != -1) {
+        // The server responded but refused the upgrade (e.g. 401, 404)
+        std::cerr << "HTTP status: " << res.status() << std::endl;
+    }
 }
 ```
 
@@ -286,8 +335,14 @@ httplib::Headers headers = {
 };
 
 httplib::ws::WebSocketClient ws("ws://localhost:8080/ws", headers);
-ws.set_read_timeout(30, 0);   // 30 seconds
-ws.set_write_timeout(10, 0);  // 10 seconds
+ws.set_connection_timeout(5, 0); // 5 seconds
+ws.set_read_timeout(30, 0);      // 30 seconds
+ws.set_write_timeout(10, 0);     // 10 seconds
+
+// std::chrono is also supported
+ws.set_connection_timeout(std::chrono::seconds(5));
+ws.set_read_timeout(std::chrono::seconds(30));
+ws.set_write_timeout(std::chrono::seconds(10));
 
 if (ws.connect()) {
     std::string msg;
@@ -341,6 +396,7 @@ if (ws.connect()) {
 httplib::ws::WebSocketClient ws("wss://example.com/ws");
 ws.set_ca_cert_path("/path/to/ca-bundle.crt");
 ws.enable_server_certificate_verification(true);
+ws.enable_server_hostname_verification(true); // default; false skips the identity check
 
 if (ws.connect()) {
     ws.send("secure message");

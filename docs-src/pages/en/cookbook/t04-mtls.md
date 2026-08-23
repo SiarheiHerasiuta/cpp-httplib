@@ -57,6 +57,22 @@ auto res = cli.Get("/");
 
 Note you're using `SSLClient` directly, not `Client`. If the private key has a password, pass it as the fifth argument.
 
+The client side has the same `PemMemory` struct too, letting you set the client certificate from PEM in memory.
+
+```cpp
+httplib::SSLClient::PemMemory pem{};
+pem.cert_pem = client_cert.data();
+pem.cert_pem_len = client_cert.size();
+pem.key_pem = client_key.data();
+pem.key_pem_len = client_key.size();
+
+httplib::SSLClient cli("api.example.com", 443, pem);
+
+auto res = cli.Get("/");
+```
+
+> For mTLS with a WebSocket client (`wss://`), see [W05. Configure TLS for wss:// Connections](../w05-websocket-tls).
+
 ## Read client info from a handler
 
 To see which client connected from inside a handler, use `req.peer_cert()`. Details in [T05. Access the peer certificate on the server](../t05-peer-cert).
