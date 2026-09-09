@@ -1,6 +1,6 @@
 ---
 title: "W04. バイナリフレームを送受信する"
-order: 54
+order: 55
 status: "draft"
 ---
 
@@ -41,6 +41,9 @@ switch (result) {
     break;
   case httplib::ws::ReadResult::Fail:
     // エラーまたは切断
+    break;
+  case httplib::ws::ReadResult::Timeout:
+    // 読み取りタイムアウト。接続は開いたまま
     break;
 }
 ```

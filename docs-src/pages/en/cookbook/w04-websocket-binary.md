@@ -1,6 +1,6 @@
 ---
 title: "W04. Send and Receive Binary Frames"
-order: 54
+order: 55
 status: "draft"
 ---
 
@@ -41,6 +41,9 @@ switch (result) {
     break;
   case httplib::ws::ReadResult::Fail:
     // error or closed
+    break;
+  case httplib::ws::ReadResult::Timeout:
+    // read timeout elapsed; the connection is still open
     break;
 }
 ```

@@ -1,5 +1,5 @@
 CXX = clang++
-CXXFLAGS = -g -std=c++11 -I. -Wall -Wextra -Wtype-limits -Wconversion -Wshadow $(EXTRA_CXXFLAGS) -DCPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO -fsanitize=address # -fno-exceptions -DCPPHTTPLIB_NO_EXCEPTIONS
+CXXFLAGS = -g -std=c++11 -I. -Wall -Wextra -Wtype-limits -Wconversion -Wshadow -DCPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO -fsanitize=address $(EXTRA_CXXFLAGS) # -fno-exceptions -DCPPHTTPLIB_NO_EXCEPTIONS
 
 ifneq ($(OS), Windows_NT)
 	UNAME_S := $(shell uname -s)
@@ -262,6 +262,10 @@ test_benchmark : test_benchmark.cc ../httplib.h Makefile
 
 test_websocket_heartbeat : test_websocket_heartbeat.cc ../httplib.h Makefile
 	$(CXX) -o $@ -I.. $(CXXFLAGS) test_websocket_heartbeat.cc $(TEST_ARGS)
+	@file $@
+
+test_websocket_thread_safety : test_websocket_thread_safety.cc ../httplib.h Makefile cert.pem
+	$(CXX) -o $@ -I.. $(CXXFLAGS) test_websocket_thread_safety.cc $(TEST_ARGS)
 	@file $@
 
 test_proxy : test_proxy.cc ../httplib.h Makefile cert.pem

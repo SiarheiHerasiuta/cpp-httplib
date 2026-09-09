@@ -173,7 +173,8 @@ template <typename T> void BaseAuthTestFromHTTPWatch(T &cli) {
         cli.Get("/basic-auth/hello/world",
                 Headers{make_basic_authentication_header("hello", "world")});
     ASSERT_TRUE(res != nullptr);
-    EXPECT_EQ(normalizeJson("{\"authenticated\":true,\"user\":\"hello\"}\n"),
+    EXPECT_EQ(normalizeJson("{\"authenticated\":true,\"user\":\"hello\","
+                            "\"authorized\":true}\n"),
               normalizeJson(res->body));
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
@@ -182,7 +183,8 @@ template <typename T> void BaseAuthTestFromHTTPWatch(T &cli) {
     cli.set_basic_auth("hello", "world");
     auto res = cli.Get("/basic-auth/hello/world");
     ASSERT_TRUE(res != nullptr);
-    EXPECT_EQ(normalizeJson("{\"authenticated\":true,\"user\":\"hello\"}\n"),
+    EXPECT_EQ(normalizeJson("{\"authenticated\":true,\"user\":\"hello\","
+                            "\"authorized\":true}\n"),
               normalizeJson(res->body));
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
@@ -203,13 +205,14 @@ template <typename T> void BaseAuthTestFromHTTPWatch(T &cli) {
 }
 
 TEST(BaseAuthTest, NoSSL) {
-  Client cli("httpcan.org");
+  Client cli("httpbin");
   BaseAuthTestFromHTTPWatch(cli);
 }
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
 TEST(BaseAuthTest, SSL) {
-  SSLClient cli("httpcan.org");
+  SSLClient cli("httpbin");
+  cli.enable_server_certificate_verification(false);
   BaseAuthTestFromHTTPWatch(cli);
 }
 #endif
@@ -228,21 +231,21 @@ template <typename T> void DigestAuthTestFromHTTPWatch(T &cli) {
   }
 
   {
+    // go-httpbin (the "httpbin" test double) only implements MD5 and
+    // SHA-256 for digest auth, so SHA-256 is as far as this can exercise
+    // the client's digest-auth algorithm selection end-to-end.
     std::vector<std::string> paths = {
         "/digest-auth/auth/hello/world/MD5",
         "/digest-auth/auth/hello/world/SHA-256",
-        "/digest-auth/auth/hello/world/SHA-512",
     };
 
     cli.set_digest_auth("hello", "world");
     for (auto path : paths) {
       auto res = cli.Get(path.c_str());
       ASSERT_TRUE(res != nullptr);
-      std::string algo(path.substr(path.rfind('/') + 1));
-      EXPECT_EQ(
-          normalizeJson("{\"algorithm\":\"" + algo +
-                        "\",\"authenticated\":true,\"user\":\"hello\"}\n"),
-          normalizeJson(res->body));
+      EXPECT_EQ(normalizeJson("{\"authenticated\":true,\"user\":\"hello\","
+                              "\"authorized\":true}\n"),
+                normalizeJson(res->body));
       EXPECT_EQ(StatusCode::OK_200, res->status);
     }
 
@@ -263,12 +266,13 @@ template <typename T> void DigestAuthTestFromHTTPWatch(T &cli) {
 }
 
 TEST(DigestAuthTest, SSL) {
-  SSLClient cli("httpcan.org");
+  SSLClient cli("httpbin");
+  cli.enable_server_certificate_verification(false);
   DigestAuthTestFromHTTPWatch(cli);
 }
 
 TEST(DigestAuthTest, NoSSL) {
-  Client cli("httpcan.org");
+  Client cli("httpbin");
   DigestAuthTestFromHTTPWatch(cli);
 }
 #endif
