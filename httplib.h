@@ -8,8 +8,8 @@
 #ifndef CPPHTTPLIB_HTTPLIB_H
 #define CPPHTTPLIB_HTTPLIB_H
 
-#define CPPHTTPLIB_VERSION "0.54.1"
-#define CPPHTTPLIB_VERSION_NUM "0x003601"
+#define CPPHTTPLIB_VERSION "0.58.0"
+#define CPPHTTPLIB_VERSION_NUM "0x003a00"
 
 #ifdef _WIN32
 #if defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0A00
@@ -235,7 +235,10 @@
 #endif
 
 // 0 waits forever. A read timeout is how a caller gets control back to send on
-// the same connection; it is not a liveness check (that is ping/pong).
+// the same connection; it is not a liveness check (that is ping/pong). Only a
+// timeout set at runtime through set_read_timeout() is reported as
+// ws::Timeout; when one of these compile-time defaults elapses, read() returns
+// ws::Fail and closes the connection.
 #ifndef CPPHTTPLIB_WEBSOCKET_CLIENT_READ_TIMEOUT_SECOND
 #define CPPHTTPLIB_WEBSOCKET_CLIENT_READ_TIMEOUT_SECOND 0
 #endif
@@ -934,6 +937,48 @@ inline bool parse_url(const std::string &url, UrlComponents &uc) {
   }
 
   return true;
+}
+
+// Resolves a relative-path or query-only Location value against the path of
+// the request being redirected (RFC 3986 section 5.2). Absolute URIs and
+// references starting with '/' are returned unchanged.
+inline std::string resolve_relative_location(const std::string &location,
+                                             const std::string &base) {
+  if (location.empty() || location[0] == '/') { return location; }
+
+  // A ':' in the first segment means the value has a scheme.
+  if (location.find(':') < location.find_first_of("/?#")) { return location; }
+
+  if (location[0] == '#') { return base.substr(0, base.find('#')) + location; }
+
+  auto base_path = base.substr(0, base.find_first_of("?#"));
+  if (location[0] == '?') { return base_path + location; }
+
+  if (base_path.empty() || base_path[0] != '/') { base_path = "/"; }
+  auto merged = base_path.substr(0, base_path.rfind('/') + 1) + location;
+
+  // Remove "." and ".." segments from the merged path.
+  auto path_end = (std::min)(merged.find_first_of("?#"), merged.size());
+  std::string path;
+  size_t i = 0;
+  while (i < path_end) {
+    auto next = (std::min)(merged.find('/', i + 1), path_end);
+    auto segment = merged.substr(i + 1, next - i - 1);
+    auto is_last = next == path_end;
+    if (segment == "." || segment == "..") {
+      if (segment == "..") {
+        path.erase((std::min)(path.rfind('/'), path.size()));
+      }
+      if (is_last) { path += '/'; }
+    } else {
+      path += '/';
+      path += segment;
+    }
+    i = next;
+  }
+  if (path.empty()) { path = "/"; }
+
+  return path + merged.substr(path_end);
 }
 
 } // namespace detail
@@ -1753,6 +1798,7 @@ struct Request {
 
   // private members...
   bool body_consumed_ = false;
+  bool expect_100_continue_pending_ = false;
   size_t redirect_count_ = CPPHTTPLIB_REDIRECT_MAX_COUNT;
   size_t content_length_ = 0;
   ContentProvider content_provider_;
@@ -1838,6 +1884,7 @@ struct Response {
   ContentProvider content_provider_;
   ContentProviderResourceReleaser content_provider_resource_releaser_;
   bool is_chunked_content_provider_ = false;
+  bool is_file_content_provider_ = false;
   bool content_provider_success_ = false;
   std::string file_content_path_;
   std::string file_content_content_type_;
@@ -2982,7 +3029,7 @@ private:
   bool read_response_line(Stream &strm, const Request &req, Response &res,
                           bool skip_100_continue = true) const;
   bool write_request(Stream &strm, Request &req, bool close_connection,
-                     Error &error, bool skip_body = false);
+                     Error &error, bool skip_body, bool &rejected_locally);
   bool write_request_body(Stream &strm, Request &req, Error &error);
   void prepare_default_headers(Request &r, bool for_stream,
                                const std::string &ct);
@@ -3910,6 +3957,7 @@ bool is_field_vchar(char c);
 bool is_field_content(const std::string &s);
 bool is_field_value(const std::string &s);
 bool is_field_valid(const std::string &name, const std::string &value);
+bool is_request_target(const std::string &s);
 
 } // namespace fields
 } // namespace detail
@@ -4443,6 +4491,11 @@ public:
   // Bound how long read() waits before returning Timeout. 0 waits forever.
   // A server handler owns its connection's timeout this way; a client sets it
   // through WebSocketClient. Safe to call while another thread is in read().
+  //
+  // Only a timeout set here is reported as Timeout. The compile-time default
+  // (CPPHTTPLIB_WEBSOCKET_SERVER_READ_TIMEOUT_SECOND) is a backstop rather
+  // than a request for control, so when it elapses read() returns Fail and
+  // closes the connection, and `while (ws.read(msg))` ends as it always has.
   void set_read_timeout(time_t sec, time_t usec = 0);
   template <class Rep, class Period>
   void set_read_timeout(const std::chrono::duration<Rep, Period> &duration);
@@ -4482,6 +4535,10 @@ private:
   int max_missed_pongs_;
   int unacked_pings_ = 0;
   std::atomic<bool> closed_{false};
+  // Set once the caller has bounded read() through set_read_timeout(). Until
+  // then the timeout in effect is the compile-time default, and elapsing it
+  // is a failure that closes the connection, not a Timeout.
+  std::atomic<bool> read_timeout_set_{false};
   std::mutex write_mutex_;
   // Owned by whichever thread is parsing frames off strm_. Only one thread
   // may do so: read_websocket_frame() reads a payload until it has the whole
@@ -4571,6 +4628,7 @@ private:
   std::unique_ptr<WebSocket> ws_;
   time_t read_timeout_sec_ = CPPHTTPLIB_WEBSOCKET_CLIENT_READ_TIMEOUT_SECOND;
   time_t read_timeout_usec_ = 0;
+  bool read_timeout_set_ = false; // see WebSocket::read_timeout_set_
   time_t write_timeout_sec_ = CPPHTTPLIB_CLIENT_WRITE_TIMEOUT_SECOND;
   time_t write_timeout_usec_ = CPPHTTPLIB_CLIENT_WRITE_TIMEOUT_USECOND;
   time_t websocket_ping_interval_sec_ =
@@ -4856,7 +4914,8 @@ inline bool SSEClient::parse_sse_line(const std::string &line, SSEMessage &msg,
     msg.id = value;
   } else if (field == "retry") {
     // Parse retry interval in milliseconds
-    {
+    // Per the SSE spec, a value that is not all ASCII digits is ignored.
+    if (detail::is_numeric(value)) {
       int v = 0;
       auto res =
           detail::from_chars(value.data(), value.data() + value.size(), v);
@@ -4992,11 +5051,15 @@ inline bool SSEClient::should_reconnect(int count) const {
 }
 
 inline void SSEClient::wait_for_reconnect() {
-  // Use small increments to check running_ flag frequently
+  // Use small increments to check running_ flag frequently.
+  // Always wait at least one increment, so that a zero interval (e.g.
+  // "retry: 0" from the server) cannot cause a busy reconnect loop.
+  const auto step_ms = 100;
+  auto interval_ms = (std::max)(reconnect_interval_ms_, step_ms);
   auto waited = 0;
-  while (running_.load() && waited < reconnect_interval_ms_) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    waited += 100;
+  while (running_.load() && waited < interval_ms) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
+    waited += step_ms;
   }
 }
 
@@ -5764,15 +5827,15 @@ inline std::string encode_path(const std::string &s) {
     switch (s[i]) {
     case ' ': result += "%20"; break;
     case '+': result += "%2B"; break;
-    case '\r': result += "%0D"; break;
-    case '\n': result += "%0A"; break;
     case '\'': result += "%27"; break;
     case ',': result += "%2C"; break;
     // case ':': result += "%3A"; break; // ok? probably...
     case ';': result += "%3B"; break;
     default:
       auto c = static_cast<uint8_t>(s[i]);
-      if (c >= 0x80) {
+      // Control characters (incl. CR/LF) and non-ASCII bytes are not allowed
+      // in a request-target as-is.
+      if (c < 0x20 || c == 0x7f || c >= 0x80) {
         result += '%';
         char hex[4];
         auto len = snprintf(hex, sizeof(hex) - 1, "%02X", c);
@@ -5897,6 +5960,13 @@ inline bool parse_trailers(stream_line_reader &line_reader, Headers &dest,
     // to look up.
     split(trailer_header.data(), trailer_header.data() + trailer_header.size(),
           ',', [&](const char *b, const char *e) {
+            // A legitimate message declares only a handful of trailers. Cap the
+            // set so a peer cannot grow it without bound: an oversized set only
+            // arises from an attempt to force many colliding names into
+            // quadratic lookups (case_ignore::hash is unkeyed).
+            if (declared_trailers.size() >= CPPHTTPLIB_HEADER_MAX_COUNT) {
+              return;
+            }
             std::string key(b, e);
             if (prohibited_trailers.find(key) == prohibited_trailers.end()) {
               declared_trailers.insert(key);
@@ -5907,6 +5977,8 @@ inline bool parse_trailers(stream_line_reader &line_reader, Headers &dest,
   size_t trailer_header_count = 0;
   while (strcmp(line_reader.ptr(), "\r\n") != 0) {
     if (line_reader.size() > CPPHTTPLIB_HEADER_MAX_LENGTH) { return false; }
+    // Count every received trailer field, not only the declared ones stored in
+    // dest, so undeclared fields cannot keep this loop running past the limit.
     if (trailer_header_count >= CPPHTTPLIB_HEADER_MAX_COUNT) { return false; }
 
     constexpr auto line_terminator_len = 2;
@@ -5919,11 +5991,12 @@ inline bool parse_trailers(stream_line_reader &line_reader, Headers &dest,
                         if (declared_trailers.find(key) !=
                             declared_trailers.end()) {
                           dest.emplace(key, val);
-                          trailer_header_count++;
                         }
                       })) {
       return false;
     }
+
+    trailer_header_count++;
 
     if (!line_reader.getline()) { return false; }
   }
@@ -7556,7 +7629,8 @@ inline bool parse_quality(const char *b, const char *e, std::string &token,
 
                double v = 0.0;
                auto res = from_chars(pb + r.first, pb + r.second, v);
-               if (res.ec != std::errc{} || v < 0.0 || v > 1.0) {
+               if (res.ec != std::errc{} || res.ptr != pb + r.second ||
+                   v < 0.0 || v > 1.0) {
                  invalid = true;
                  return true;
                }
@@ -8365,6 +8439,17 @@ inline bool is_chunked_transfer_encoding(const Headers &headers) {
   return case_ignore::equal(last_coding, "chunked");
 }
 
+inline bool has_conflicting_content_length(const Headers &headers) {
+  // RFC 9112 §6.3: a message carrying both Transfer-Encoding and a non-zero
+  // Content-Length is framed ambiguously. The body readers here delimit it by
+  // the transfer coding and drop Content-Length, while an intermediary may do
+  // the reverse, so the two disagree on where the body ends and a reused
+  // connection is desynchronised (request/response smuggling). Content-Length:
+  // 0 is tolerated for compatibility with existing peers.
+  return has_header(headers, "Transfer-Encoding") &&
+         get_header_value_u64(headers, "Content-Length", 0, 0) > 0;
+}
+
 template <typename T, typename U>
 bool prepare_content_receiver(T &x, int &status,
                               ContentReceiverWithProgress receiver,
@@ -8482,12 +8567,11 @@ bool read_content(Stream &strm, T &x, size_t payload_max_length, int &status,
 
 inline ssize_t write_request_line(Stream &strm, const std::string &method,
                                   const std::string &path) {
-  // A request target must not carry CR/LF (or other control octets); otherwise
-  // a value smuggled into it splits the request line and injects headers or a
-  // whole request. The same field-value check already guards header values in
-  // check_and_write_headers and the request target in
-  // perform_websocket_handshake; apply it here too.
-  if (!fields::is_field_value(path)) { return -1; }
+  // Neither the method nor the request target may carry CR/LF, SP or other
+  // control octets; otherwise a value smuggled into either splits the request
+  // line and injects headers or a whole request.
+  if (!fields::is_token(method)) { return -1; }
+  if (!fields::is_request_target(path)) { return -1; }
 
   std::string s = method;
   s += ' ';
@@ -8709,9 +8793,9 @@ inline bool compress_content_provider(const ContentProvider &content_provider,
   return cmp.compress(nullptr, 0, true, append);
 }
 
-// Serves `m` as the response body. `set_content_provider()` clears the coding,
-// so recording it has to come after; keeping both here means a third
-// file-serving path cannot get that order wrong.
+// Serves `m` as the response body. `set_content_provider()` clears the coding
+// and the file flag, so recording them has to come after; keeping all of it
+// here means a third file-serving path cannot get that order wrong.
 inline void set_file_content_provider(Response &res,
                                       const std::shared_ptr<mmap> &m,
                                       const std::string &content_type,
@@ -8723,6 +8807,7 @@ inline void set_file_content_provider(Response &res,
         return true;
       });
 
+  res.is_file_content_provider_ = true;
   res.content_coding_ = encoding;
 }
 
@@ -9049,13 +9134,20 @@ inline bool parse_range_header(const std::string &s, Ranges &ranges) try {
 
       ssize_t first = -1;
       if (!lhs.empty()) {
-        ssize_t v;
-        auto res = detail::from_chars(lhs.data(), lhs.data() + lhs.size(), v);
-        if (res.ec == std::errc{}) { first = v; }
+        // Reject an overflowing first-byte-pos; treating it as absent (-1)
+        // would turn the range into a suffix range.
+        auto res =
+            detail::from_chars(lhs.data(), lhs.data() + lhs.size(), first);
+        if (res.ec != std::errc{}) {
+          all_valid_ranges = false;
+          return;
+        }
       }
 
       ssize_t last = -1;
       if (!rhs.empty()) {
+        // An overflowing last-byte-pos is past any content length, so keeping
+        // -1 ("remainder", RFC 9110 14.1.2) is correct here.
         ssize_t v;
         auto res = detail::from_chars(rhs.data(), rhs.data() + rhs.size(), v);
         if (res.ec == std::errc{}) { last = v; }
@@ -10131,6 +10223,12 @@ inline bool is_field_value(const std::string &s) { return is_field_content(s); }
 
 inline bool is_field_valid(const std::string &name, const std::string &value) {
   return is_field_name(name) && is_field_value(value);
+}
+
+// RFC 9112 §2.2/§3.2: the request-target has no SP, HTAB or other control
+// characters (incl. bare CR). obs-text (raw UTF-8) is allowed.
+inline bool is_request_target(const std::string &s) {
+  return std::all_of(s.begin(), s.end(), is_field_vchar);
 }
 
 } // namespace fields
@@ -11616,6 +11714,7 @@ inline void Response::set_content_provider(
   if (in_length > 0) { content_provider_ = std::move(provider); }
   content_provider_resource_releaser_ = std::move(resource_releaser);
   is_chunked_content_provider_ = false;
+  is_file_content_provider_ = false;
   content_coding_ = detail::EncodingType::None;
 }
 
@@ -11627,6 +11726,7 @@ inline void Response::set_content_provider(
   content_provider_ = detail::ContentProviderAdapter(std::move(provider));
   content_provider_resource_releaser_ = std::move(resource_releaser);
   is_chunked_content_provider_ = false;
+  is_file_content_provider_ = false;
   content_coding_ = detail::EncodingType::None;
 }
 
@@ -11638,6 +11738,7 @@ inline void Response::set_chunked_content_provider(
   content_provider_ = detail::ContentProviderAdapter(std::move(provider));
   content_provider_resource_releaser_ = std::move(resource_releaser);
   is_chunked_content_provider_ = true;
+  is_file_content_provider_ = false;
   content_coding_ = detail::EncodingType::None;
 }
 
@@ -13204,6 +13305,8 @@ inline bool Server::parse_request_line(const char *s, Request &req) const {
     return false;
   }
 
+  if (!detail::fields::is_request_target(req.target)) { return false; }
+
   {
     // Skip URL fragment
     for (size_t i = 0; i < req.target.size(); i++) {
@@ -13257,7 +13360,10 @@ inline bool Server::write_response_core(Stream &strm, bool close_connection,
   // Prepare additional headers
   if (close_connection ||
       detail::has_header_token(req.headers, "Connection", "close") ||
-      400 <= res.status) { // Don't leave connections open after errors
+      400 <= res.status || // Don't leave connections open after errors
+      // The client withholds the body until `100 Continue`, which was never
+      // sent, so whether and when the body follows is unknown.
+      (req.expect_100_continue_pending_ && detail::has_framed_body(req))) {
     res.set_header("Connection", "close");
   } else {
     std::string s = "timeout=";
@@ -13288,9 +13394,27 @@ inline bool Server::write_response_core(Stream &strm, bool close_connection,
   if (!detail::write_response_line(bstrm, res.status)) { return false; }
   if (header_writer_(bstrm, res.headers) <= 0) { return false; }
 
-  // Combine small body with headers to reduce write syscalls
-  if (req.method != "HEAD" && !res.body.empty() && !res.content_provider_) {
-    bstrm.write(res.body.data(), res.body.size());
+  // Combine a small body with the headers so the whole response leaves in a
+  // single write. A large body is written on its own instead: a copy of it
+  // costs more than the extra write saves.
+  auto send_body = req.method != "HEAD";
+  auto body_is_separate = false;
+  auto provider_done = false;
+  if (send_body && !res.body.empty() && !res.content_provider_) {
+    if (res.body.size() < CPPHTTPLIB_SEND_BUFSIZ) {
+      bstrm.write(res.body.data(), res.body.size());
+    } else {
+      body_is_separate = true;
+    }
+  } else if (send_body && res.content_provider_ &&
+             res.is_file_content_provider_ &&
+             res.content_length_ < CPPHTTPLIB_SEND_BUFSIZ) {
+    // A small file is read into the same buffer. Other providers may produce
+    // their data over time, so they are never held back.
+    if (!write_content_with_provider(bstrm, req, res, boundary, content_type)) {
+      return false;
+    }
+    provider_done = true;
   }
 
   // Log before writing to avoid race condition with client-side code that
@@ -13301,17 +13425,20 @@ inline bool Server::write_response_core(Stream &strm, bool close_connection,
   auto &data = bstrm.get_buffer();
   if (!detail::write_data(strm, data.data(), data.size())) { return false; }
 
-  // Streaming body
-  auto ret = true;
-  if (req.method != "HEAD" && res.content_provider_) {
-    if (write_content_with_provider(strm, req, res, boundary, content_type)) {
-      res.content_provider_success_ = true;
-    } else {
-      ret = false;
-    }
+  if (body_is_separate) {
+    return detail::write_data(strm, res.body.data(), res.body.size());
   }
 
-  return ret;
+  // Streaming body
+  if (send_body && res.content_provider_) {
+    if (!provider_done &&
+        !write_content_with_provider(strm, req, res, boundary, content_type)) {
+      return false;
+    }
+    res.content_provider_success_ = true;
+  }
+
+  return true;
 }
 
 inline bool
@@ -13507,6 +13634,13 @@ inline bool Server::read_content_core(
     return true;
   }
 #endif
+
+  // The client is waiting for this before it sends the body.
+  if (req.expect_100_continue_pending_) {
+    req.expect_100_continue_pending_ = false;
+    detail::write_response_line(strm, StatusCode::Continue_100);
+    strm.write("\r\n");
+  }
 
   if (!detail::read_content(strm, req, payload_max_length_, res.status, nullptr,
                             out, true)) {
@@ -14268,8 +14402,8 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
   // coding is not chunked, which leaves the body length undeterminable. The
   // latter must not fall through to the "no body" path, or the body bytes are
   // parsed as the next request on a persistent connection.
-  if (req.has_header("Transfer-Encoding") &&
-      (req.get_header_value_u64("Content-Length") > 0 ||
+  if (detail::has_conflicting_content_length(req.headers) ||
+      (req.has_header("Transfer-Encoding") &&
        !detail::is_chunked_transfer_encoding(req.headers))) {
     connection_closed = true;
     res.status = StatusCode::BadRequest_400;
@@ -14345,19 +14479,20 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
   // case-insensitive, and a 100-continue expectation in an HTTP/1.0 request
   // must be ignored. An expectation we do not recognize is left alone; the
   // 417 the section allows for one is a MAY, not a requirement.
+  //
+  // `100 Continue` itself is deferred until the body is actually read (see
+  // read_content_core), so a request rejected by a later handler never
+  // invites the client to send a body nobody will read.
   if (req.version != "HTTP/1.0" &&
       detail::has_header_token(req.headers, "Expect", "100-continue")) {
     int status = StatusCode::Continue_100;
     if (expect_100_continue_handler_) {
       status = expect_100_continue_handler_(req, res);
     }
-    switch (status) {
-    case StatusCode::Continue_100:
-    case StatusCode::ExpectationFailed_417:
-      detail::write_response_line(strm, status);
-      strm.write("\r\n");
-      break;
-    default:
+    if (status == StatusCode::Continue_100) {
+      req.expect_100_continue_pending_ = true;
+    } else {
+      if (res.status == -1) { res.status = status; }
       connection_closed = true;
       return write_response(strm, true, req, res);
     }
@@ -14370,18 +14505,25 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
   };
 
   // WebSocket upgrade
-  // Check pre_routing_handler_ before upgrading so that authentication
-  // and other middleware can reject the request with an HTTP response
-  // (e.g., 401) before the protocol switches.
+  // Run pre_routing_handler_ and pre_request_handler_ before upgrading so
+  // that authentication and other middleware can reject the request with an
+  // HTTP response (e.g., 401) before the protocol switches.
   if (detail::is_websocket_upgrade(req)) {
     if (pre_routing_handler_ &&
         pre_routing_handler_(req, res) == HandlerResponse::Handled) {
       if (res.status == -1) { res.status = StatusCode::OK_200; }
-      return write_response(strm, close_connection, req, res);
+      return write_response_with_content(strm, close_connection, req, res);
     }
     // Find matching WebSocket handler
     for (const auto &entry : websocket_handlers_) {
       if (entry.matcher->match(req)) {
+        req.matched_route = entry.matcher->pattern();
+        if (pre_request_handler_ &&
+            pre_request_handler_(req, res) == HandlerResponse::Handled) {
+          if (res.status == -1) { res.status = StatusCode::OK_200; }
+          return write_response_with_content(strm, close_connection, req, res);
+        }
+
         // Compute accept key
         auto client_key = req.get_header_value("Sec-WebSocket-Key");
         auto accept_key = detail::websocket_accept_key(client_key);
@@ -14929,8 +15071,12 @@ inline Result ClientImpl::send_(Request &&req) {
 inline void ClientImpl::prepare_default_headers(Request &r, bool for_stream,
                                                 const std::string &ct) {
   (void)for_stream;
-  for (const auto &header : default_headers_) {
-    if (!r.has_header(header.first)) { r.headers.insert(header); }
+  // Default headers are meant for the origin and may carry its credentials, so
+  // keep them off the CONNECT request the proxy reads.
+  if (r.method != "CONNECT") {
+    for (const auto &header : default_headers_) {
+      if (!r.has_header(header.first)) { r.headers.insert(header); }
+    }
   }
 
   // RFC 9110 5.3 recommends sending control data such as Host first, so
@@ -15053,16 +15199,30 @@ ClientImpl::open_stream(const std::string &method, const std::string &path,
   prepare_default_headers(req, true, content_type);
 
   auto &strm = *handle.stream_;
-  if (detail::write_request_line(strm, req.method, req.path) < 0) {
-    handle.error = Error::Write;
-    handle.response.reset();
-    return handle;
-  }
 
-  if (!detail::check_and_write_headers(strm, req.headers, header_writer_,
-                                       handle.error)) {
-    handle.response.reset();
-    return handle;
+  // Build the request line and headers in memory first, like write_request()
+  // does, so that a rejected header leaves nothing on the wire.
+  {
+    detail::BufferStream bstrm;
+
+    if (detail::write_request_line(bstrm, req.method, req.path) < 0) {
+      handle.error = Error::Write;
+      handle.response.reset();
+      return handle;
+    }
+
+    if (!detail::check_and_write_headers(bstrm, req.headers, header_writer_,
+                                         handle.error)) {
+      handle.response.reset();
+      return handle;
+    }
+
+    const auto &data = bstrm.get_buffer();
+    if (!detail::write_data(strm, data.data(), data.size())) {
+      handle.error = Error::Write;
+      handle.response.reset();
+      return handle;
+    }
   }
 
   if (!body.empty()) {
@@ -15075,6 +15235,17 @@ ClientImpl::open_stream(const std::string &method, const std::string &path,
 
   if (!read_response_line(strm, req, *handle.response) ||
       !detail::read_headers(strm, handle.response->headers)) {
+    handle.error = Error::Read;
+    handle.response.reset();
+    return handle;
+  }
+
+  // Same framing check as ClientImpl::process_request(). A HEAD or bodyless
+  // (204/304) response legitimately carries framing headers with no body.
+  if (method != "HEAD" &&
+      handle.response->status != StatusCode::NoContent_204 &&
+      handle.response->status != StatusCode::NotModified_304 &&
+      detail::has_conflicting_content_length(handle.response->headers)) {
     handle.error = Error::Read;
     handle.response.reset();
     return handle;
@@ -15226,22 +15397,45 @@ inline ssize_t ChunkedDecoder::read_payload(char *buf, size_t len,
     stream_line_reader lr(strm, line_buf, sizeof(line_buf));
     if (!lr.getline()) { return -1; }
 
+    // Everything below is bounded by eol rather than by the buffer's NUL, so
+    // the line terminator is never mistaken for line content.
+    const char *eol = lr.ptr() + lr.size();
+    if (lr.end_with_crlf()) {
+      eol -= 2;
+    } else if (eol != lr.ptr() && eol[-1] == '\n') {
+      // Only reachable under CPPHTTPLIB_ALLOW_LF_AS_LINE_TERMINATOR, where
+      // getline() ends the line on a bare LF. That LF is the terminator, so it
+      // has to come off here or the check below would reject the line.
+      eol -= 1;
+    }
+
     // RFC 9112 §7.1: chunk-size = 1*HEXDIG
     const char *p = lr.ptr();
     int v = 0;
-    if (!is_hex(*p, v)) { return -1; }
+    if (p == eol || !is_hex(*p, v)) { return -1; }
 
     size_t chunk_len = 0;
     constexpr size_t chunk_len_max = (std::numeric_limits<size_t>::max)();
-    for (; is_hex(*p, v); ++p) {
+    for (; p < eol && is_hex(*p, v); ++p) {
       if (chunk_len > (chunk_len_max >> 4)) { return -1; }
       chunk_len = (chunk_len << 4) | static_cast<size_t>(v);
     }
 
-    while (is_space_or_tab(*p)) {
+    while (p < eol && is_space_or_tab(*p)) {
       ++p;
     }
-    if (*p != '\0' && *p != ';' && *p != '\r' && *p != '\n') { return -1; }
+
+    // RFC 9112 §7.1.1: only a chunk-ext may sit between the size and the line
+    // terminator, and it is built from tokens and quoted-strings, so it never
+    // holds a CR, LF or any other control character. getline() reads up to the
+    // CRLF, so a bare LF left in here would be swallowed as extension text
+    // while an intermediary that ends the line on it delimits the chunks
+    // differently, and the two disagree on where the body ends (request
+    // smuggling).
+    if (p < eol && *p != ';') { return -1; }
+    for (; p < eol; ++p) {
+      if (!is_space_or_tab(*p) && !fields::is_field_vchar(*p)) { return -1; }
+    }
 
     if (chunk_len == 0) {
       chunk_remaining = 0;
@@ -15392,7 +15586,10 @@ inline bool ClientImpl::redirect(Request &req, Response &res, Error &error) {
   if (location.empty()) { return false; }
 
   detail::UrlComponents uc;
-  if (!detail::parse_url(location, uc)) { return false; }
+  if (!detail::parse_url(detail::resolve_relative_location(location, req.path),
+                         uc)) {
+    return false;
+  }
 
   // Only follow http/https redirects
   if (!uc.scheme.empty() && uc.scheme != "http" && uc.scheme != "https") {
@@ -15581,7 +15778,9 @@ inline bool ClientImpl::write_content_with_provider(Stream &strm,
 
 inline bool ClientImpl::write_request(Stream &strm, Request &req,
                                       bool close_connection, Error &error,
-                                      bool skip_body) {
+                                      bool skip_body, bool &rejected_locally) {
+  rejected_locally = false;
+
   // Prepare additional headers
   if (close_connection) {
     if (!req.has_header("Connection")) {
@@ -15611,24 +15810,24 @@ inline bool ClientImpl::write_request(Stream &strm, Request &req,
     }
   }
 
-  if (!basic_auth_password_.empty() || !basic_auth_username_.empty()) {
-    if (!req.has_header("Authorization")) {
+  // A CONNECT request is read by the proxy; everything sent through the tunnel
+  // it opens is read by the origin. Each credential goes only to its own hop.
+  auto is_connect = req.method == "CONNECT";
+
+  if (!is_connect && !req.has_header("Authorization")) {
+    if (!basic_auth_password_.empty() || !basic_auth_username_.empty()) {
       req.headers.insert(make_basic_authentication_header(
           basic_auth_username_, basic_auth_password_, false));
-    }
-  }
-
-  if (!bearer_token_auth_token_.empty()) {
-    if (!req.has_header("Authorization")) {
+    } else if (!bearer_token_auth_token_.empty()) {
       req.headers.insert(make_bearer_token_authentication_header(
           bearer_token_auth_token_, false));
     }
   }
 
-  // Proxy-Authorization is only sent when the proxy is actually used for
-  // this target — otherwise NO_PROXY-matched requests would leak proxy
-  // credentials directly to the destination server.
-  if (is_proxy_enabled_for_host(host_)) {
+  // Proxy-Authorization is only sent when the proxy reads this message —
+  // otherwise NO_PROXY-matched requests, and requests inside a TLS tunnel,
+  // would leak proxy credentials to the destination server.
+  if (is_proxy_enabled_for_host(host_) && (!is_ssl() || is_connect)) {
     if (!proxy_basic_auth_username_.empty() &&
         !proxy_basic_auth_password_.empty() &&
         !req.has_header("Proxy-Authorization")) {
@@ -15670,15 +15869,18 @@ inline bool ClientImpl::write_request(Stream &strm, Request &req,
 
     // Write request line and headers
     if (detail::write_request_line(bstrm, req.method, path_with_query) < 0) {
-      // A rejected target (e.g. CR/LF smuggled in via a decoded redirect
-      // Location under set_path_encode(false)) must fail the request cleanly
-      // instead of emitting a request-line-less, header-injecting request.
+      // A rejected method (not a token, e.g. carrying CR/LF) or target (e.g.
+      // CR/LF smuggled in via a decoded redirect Location under
+      // set_path_encode(false)) must fail the request cleanly instead of
+      // emitting a request-line-less, header-injecting request.
       error = Error::Write;
+      rejected_locally = true;
       output_error_log(error, &req);
       return false;
     }
     if (!detail::check_and_write_headers(bstrm, req.headers, header_writer_,
                                          error)) {
+      rejected_locally = true;
       output_error_log(error, &req);
       return false;
     }
@@ -15947,8 +16149,16 @@ inline bool ClientImpl::process_request(Stream &strm, Request &req,
       detail::has_header_token(req.headers, "Expect", "100-continue");
 
   // Send request (skip body if using Expect: 100-continue)
+  auto rejected_locally = false;
   auto write_request_success =
-      write_request(strm, req, close_connection, error, expect_100_continue);
+      write_request(strm, req, close_connection, error, expect_100_continue,
+                    rejected_locally);
+
+  // A failed write normally still reads the response below, since the server
+  // may have answered early (e.g. 413/414) and closed while the body was being
+  // sent. A request rejected before any byte reached the socket gets no such
+  // response, and waiting for one would block until the read timeout.
+  if (rejected_locally) { return false; }
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
   if (is_ssl() && !expect_100_continue) {
@@ -16024,6 +16234,17 @@ inline bool ClientImpl::process_request(Stream &strm, Request &req,
   // Body
   if ((res.status != StatusCode::NoContent_204) && req.method != "HEAD" &&
       req.method != "CONNECT") {
+    // Reject ambiguous framing (RFC 9112 §6.3). Unlike a request, a response
+    // whose final transfer coding is not chunked is not ambiguous: its body
+    // runs until the server closes the connection, so it is not rejected.
+    // HEAD/204 are excluded above and a 304 carries no body.
+    if (res.status != StatusCode::NotModified_304 &&
+        detail::has_conflicting_content_length(res.headers)) {
+      error = Error::Read;
+      output_error_log(error, &req);
+      return false;
+    }
+
     auto redirect = 300 < res.status && res.status < 400 &&
                     res.status != StatusCode::NotModified_304 &&
                     follow_location_;
@@ -19255,11 +19476,11 @@ inline void shutdown(session_t session, bool graceful) {
 
   auto ssl = static_cast<SSL *>(session);
   if (graceful) {
-    // First call sends close_notify
-    if (SSL_shutdown(ssl) == 0) {
-      // Second call waits for peer's close_notify
-      SSL_shutdown(ssl);
-    }
+    // Send close_notify without waiting for the peer's. The connection is
+    // closed right after this, so a unidirectional shutdown is enough, and an
+    // idle peer that never answers would otherwise hold this thread until the
+    // read timeout. The other backends do not wait either.
+    SSL_shutdown(ssl);
   }
 }
 
@@ -22267,8 +22488,11 @@ inline ReadResult WebSocket::read(std::string &msg) {
         impl::read_websocket_frame(strm_, opcode, payload, fin, is_server_,
                                    CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH);
     // A timeout landed on a frame boundary: the connection is untouched and
-    // still usable, so hand control back without closing it.
-    if (r == impl::FrameRead::Timeout) { return Timeout; }
+    // still usable, so hand control back without closing it. That is only
+    // useful to a caller who asked for the timeout; the compile-time default
+    // is a backstop against a peer gone quiet, and elapsing it closes the
+    // connection so a plain `while (ws.read(msg))` loop ends.
+    if (r == impl::FrameRead::Timeout && read_timeout_set_) { return Timeout; }
     if (r != impl::FrameRead::Ok) {
       closed_ = true;
       return Fail;
@@ -22459,6 +22683,7 @@ inline void WebSocket::set_read_timeout(time_t sec, time_t usec) {
   // negative poll uses for an unbounded wait.
   if (sec == 0 && usec == 0) { sec = -1; }
   strm_.set_read_timeout(sec, usec);
+  read_timeout_set_ = true;
 }
 
 // WebSocketClient implementation
@@ -22683,6 +22908,9 @@ inline Result WebSocketClient::connect() {
   ws_ = std::unique_ptr<WebSocket>(new WebSocket(std::move(strm), req, false,
                                                  websocket_ping_interval_sec_,
                                                  websocket_max_missed_pongs_));
+  // The stream was created with the timeout already; tell the WebSocket
+  // whether it came from the caller, so read() knows to report it as Timeout.
+  ws_->read_timeout_set_ = read_timeout_set_;
   return Result{Error::Success, upgrade.status, std::move(upgrade.headers)};
 }
 
@@ -22715,6 +22943,7 @@ inline const std::string &WebSocketClient::subprotocol() const {
 inline void WebSocketClient::set_read_timeout(time_t sec, time_t usec) {
   read_timeout_sec_ = sec;
   read_timeout_usec_ = usec;
+  read_timeout_set_ = true;
   // The members above only seed the next connect(); read() consults the
   // stream, so an already-open connection has to be told directly.
   if (ws_) { ws_->set_read_timeout(sec, usec); }
